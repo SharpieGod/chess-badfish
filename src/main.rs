@@ -229,7 +229,7 @@ impl BitBoardCollection {
         (tile as u8 % 8, 7 - (tile as u8 / 8))
     }
 
-    fn pawn_moves(&self, index: usize) -> HashSet<Move> {
+    fn pawn_moves(&self, index: usize) -> HashSet<usize> {
         let mut move_set = HashSet::new();
 
         move_set
@@ -257,10 +257,6 @@ impl Display for BitBoardCollection {
 
         Ok(())
     }
-}
-struct Move {
-    from: usize,
-    to: usize,
 }
 
 // Basically just FEN
