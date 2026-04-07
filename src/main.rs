@@ -345,6 +345,8 @@ impl<'a> MoveGen<'a> {
         attacks
     }
     fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
+        // En passant is a capture, but also a threat.
+
         let en_passant = self
             .en_passant
             .map(|ep| BitBoard(1 << ep))
@@ -368,6 +370,32 @@ impl<'a> MoveGen<'a> {
     }
     fn pawn_moves(&self, index: u8, color: Color) -> BitBoard {
         self.pawn_quiets(index, color) | self.pawn_captures(index, color)
+    }
+    fn knight_attack(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+        for (forward, right) in directions {
+            let new_file = file as i8 + forward;
+            let new_rank = rank as i8 + right;
+
+            if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
+                continue;
+            }
+
+            attack.0 |= 1 << BC::encode_tile(new_file as u8, new_rank as u8);
+        }
+
+        attack
+    }
+    fn knight_captures(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
+        self.knight_attack(index, color, directions) & self.bc.occupied_color(!color)
+    }
+    fn knight_quiets(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
+        self.knight_attack(index, color, directions) & !self.bc.occupied()
+    }
+    fn knight_moves(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
+        self.knight_quiets(index, color, directions)
+            | self.knight_captures(index, color, directions)
     }
 }
 
