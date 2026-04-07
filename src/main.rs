@@ -104,15 +104,15 @@ impl ChessPiece {
 struct BitBoard(u64);
 
 impl BitBoard {
-    fn insert(&mut self, index: usize) {
+    fn insert(&mut self, index: u8) {
         self.0 |= 1 << index;
     }
 
-    fn remove(&mut self, index: usize) {
+    fn remove(&mut self, index: u8) {
         self.0 &= !(1 << index);
     }
 
-    fn contains(&self, index: usize) -> bool {
+    fn contains(&self, index: u8) -> bool {
         self.0 & (1 << index) != 0
     }
 }
@@ -155,15 +155,15 @@ impl BitBoardCollection {
         &mut self.piece_boards[piece.color as usize][piece.kind as usize]
     }
 
-    fn insert(&mut self, index: usize, piece: &ChessPiece) {
+    fn insert(&mut self, index: u8, piece: &ChessPiece) {
         self.get_board(piece).insert(index);
     }
 
-    fn remove(&mut self, index: usize, piece: &ChessPiece) {
+    fn remove(&mut self, index: u8, piece: &ChessPiece) {
         self.get_board(piece).remove(index);
     }
 
-    fn contains(&mut self, index: usize, piece: &ChessPiece) -> bool {
+    fn contains(&mut self, index: u8, piece: &ChessPiece) -> bool {
         self.get_board(piece).contains(index)
     }
 
@@ -178,7 +178,7 @@ impl BitBoardCollection {
         BitBoard(self.occupied_color(Color::White).0 | self.occupied_color(Color::Black).0)
     }
 
-    fn piece_at_index(&self, index: usize) -> Option<ChessPiece> {
+    fn piece_at_index(&self, index: u8) -> Option<ChessPiece> {
         for c in 0..2 {
             for k in 0..6 {
                 if self.piece_boards[c][k].contains(index) {
@@ -221,15 +221,15 @@ impl BitBoardCollection {
         board_c
     }
 
-    fn encode_tile(file: u8, rank: u8) -> usize {
-        ((7 - rank) * 8 + file) as usize
+    fn encode_tile(file: u8, rank: u8) -> u8 {
+        ((7 - rank) * 8 + file)
     }
 
-    fn decode_tile(tile: usize) -> (u8, u8) {
+    fn decode_tile(tile: u8) -> (u8, u8) {
         (tile as u8 % 8, 7 - (tile as u8 / 8))
     }
 
-    fn pawn_moves(&self, index: usize) -> HashSet<usize> {
+    fn pawn_moves(&self, index: u8) -> HashSet<u8> {
         let mut move_set = HashSet::new();
 
         move_set
