@@ -137,6 +137,10 @@ impl BitBoard {
     fn contains(&self, index: u8) -> bool {
         self.0 & (1 << index) != 0
     }
+
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
 }
 impl BitAnd for BitBoard {
     type Output = BitBoard;
@@ -164,7 +168,7 @@ impl Display for BitBoard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for rank in 0..8 {
             for file in 0..8 {
-                let index = BC::encode_tile(file, rank);
+                let index = BC::encode_tile(file, 7 - rank);
 
                 let c = if self.contains(index) { '#' } else { '/' };
 
@@ -314,20 +318,38 @@ impl Game {
         }
     }
     fn pawn_moves(&self, index: u8, color: Color) -> HashSet<u8> {
-        let pawn_move = BitBoard(0b1 << index + 8) & !self.board_collection.occupied();
         let pawn_capture;
+        let (forward, start_rank_range) = match color {
+            Color::White => (8, 48..=55),
+            Color::Black => (-8, 8..=15),
+        };
+
+        let single = BitBoard(0b1 << index as i16 + forward) & !self.board_collection.occupied();
+        let double_step = if start_rank_range.contains(&index) && !single.is_empty() {
+            BitBoard(0b1 << (index as i16 + forward * 2)) & !self.board_collection.occupied()
+        } else {
+            BitBoard(0)
+        };
 
         if let Some(en_passant_index) = self.en_passant_square {
-            pawn_capture = BitBoard(0b101 << index - 1 + 7)
+            pawn_capture = BitBoard(0b101 << index - 1 + 8)
                 & (self.board_collection.occupied_color(!color)
                     | BitBoard(0b1 << en_passant_index));
         } else {
-            pawn_capture =
-                BitBoard(0b101 << index - 1 + 7) & self.board_collection.occupied_color(!color);
+            pawn_capture = BitBoard(0b101 << index as i16 - 1 + forward)
+                & self.board_collection.occupied_color(!color)
         }
-        println!("{}", pawn_move | pawn_capture);
-
-        (pawn_move | pawn_capture).break_down()
+        println!(
+            "{} {:?}",
+            self.board_collection.occupied_color(!color),
+            !color
+        );
+        println!("{}", BitBoard(1 << index));
+        println!("{}", pawn_capture);
+        (single | pawn_capture | double_step).break_down()
+    }
+    fn king_moves(&self, index: u8, color: Color) -> HashSet<u8> {
+        HashSet::new()
     }
 }
 fn clear() {
@@ -364,7 +386,7 @@ fn main() {
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
-        game.pawn_moves(9, Color::White);
+        game.pawn_moves(55, Color::Black);
         let input = take_input();
 
         if input.starts_with("mv") {
