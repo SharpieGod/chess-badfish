@@ -1,3 +1,9 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::{self, Display},
+    io,
+};
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PieceKind {
     Pawn,
@@ -7,17 +13,40 @@ enum PieceKind {
     Queen,
     King,
 }
+
+impl TryFrom<usize> for PieceKind {
+    type Error = ();
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PieceKind::Pawn),
+            1 => Ok(PieceKind::Knight),
+            2 => Ok(PieceKind::Bishop),
+            3 => Ok(PieceKind::Rook),
+            4 => Ok(PieceKind::Queen),
+            5 => Ok(PieceKind::King),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Color {
     White,
     Black,
 }
 
-use std::{
-    collections::HashMap,
-    fmt::{self, Display},
-    io,
-};
+impl TryFrom<usize> for Color {
+    type Error = ();
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Color::White),
+            1 => Ok(Color::Black),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChessPiece {
@@ -69,108 +98,181 @@ impl ChessPiece {
         c
     }
 }
-struct Board([Option<ChessPiece>; 64]);
 
-impl Board {
-    fn from_fen(fen: String) -> Self {
+// each bit is a square on the board!
+#[derive(Clone, Copy)]
+struct BitBoard(u64);
+
+impl BitBoard {
+    fn insert(&mut self, index: usize) {
+        self.0 |= 1 << index;
+    }
+
+    fn remove(&mut self, index: usize) {
+        self.0 &= !(1 << index);
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.0 & (1 << index) != 0
+    }
+}
+
+impl Display for BitBoard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for rank in 0..8 {
+            for file in 0..8 {
+                let index = BC::encode_tile(file, rank);
+
+                let c = if self.contains(index) { '#' } else { '/' };
+
+                write!(f, "{} ", c)?;
+            }
+            writeln!(f)?;
+        }
+
+        writeln!(f)?;
+        writeln!(f, "{:064b}", self.0)?;
+
+        Ok(())
+    }
+}
+
+struct BitBoardCollection {
+    // 6 pieces, 2 colours
+    piece_boards: [[BitBoard; 6]; 2],
+    // TODO: pin bitboard, and yeah
+}
+
+use BitBoardCollection as BC;
+
+impl BitBoardCollection {
+    fn new() -> Self {
+        Self {
+            piece_boards: [[BitBoard(0); 6]; 2],
+        }
+    }
+    fn get_board(&mut self, piece: &ChessPiece) -> &mut BitBoard {
+        &mut self.piece_boards[piece.color as usize][piece.kind as usize]
+    }
+
+    fn insert(&mut self, index: usize, piece: &ChessPiece) {
+        self.get_board(piece).insert(index);
+    }
+
+    fn remove(&mut self, index: usize, piece: &ChessPiece) {
+        self.get_board(piece).remove(index);
+    }
+
+    fn contains(&mut self, index: usize, piece: &ChessPiece) -> bool {
+        self.get_board(piece).contains(index)
+    }
+
+    fn occupied_color(&self, color: Color) -> BitBoard {
+        self.piece_boards[color as usize]
+            .iter()
+            .fold(BitBoard(0), |acc, b| BitBoard(acc.0 | b.0))
+    }
+
+    // All occupied squares
+    fn occupied(&self) -> BitBoard {
+        BitBoard(self.occupied_color(Color::White).0 | self.occupied_color(Color::Black).0)
+    }
+
+    fn piece_at_index(&self, index: usize) -> Option<ChessPiece> {
+        for c in 0..2 {
+            for k in 0..6 {
+                if self.piece_boards[c][k].contains(index) {
+                    return Some(ChessPiece {
+                        kind: k.try_into().unwrap(),
+                        color: c.try_into().unwrap(),
+                    });
+                }
+            }
+        }
+
+        return None;
+    }
+
+    fn from_fen(fen: &str) -> Self {
         let pieces = fen.split_ascii_whitespace().take(1).collect::<String>();
-        let mut board: [Option<ChessPiece>; 64] = [None; 64];
-        let mut board_index: u8 = 0;
+        let mut board_c = Self::new();
+        let mut rank = 7;
+        let mut file = 0;
 
         for c in pieces.chars() {
             if c == '/' {
+                file = 0;
+                rank -= 1;
                 continue;
             }
 
             if let Some(n) = c.to_digit(10) {
-                board_index += n as u8;
+                file += n as u8;
                 continue;
             }
 
-            board[board_index as usize] = ChessPiece::decode_fen(c);
-            board_index += 1;
+            board_c.insert(
+                BC::encode_tile(file, rank),
+                &ChessPiece::decode_fen(c).unwrap(),
+            );
+            file += 1
         }
 
-        Self(board)
+        board_c
     }
 
-    fn encode_tile(file: u8, rank: u8) -> u8 {
-        (7 - rank) * 8 + file
+    fn encode_tile(file: u8, rank: u8) -> usize {
+        ((7 - rank) * 8 + file) as usize
+    }
+
+    fn decode_tile(tile: usize) -> (u8, u8) {
+        (tile as u8 % 8, 7 - (tile as u8 / 8))
     }
 }
 
-impl Display for Board {
+impl Display for BitBoardCollection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Straigh up copying stockfish
-        let mut out = String::new();
-        for i in 0..64 {
-            if i % 8 == 0 {
-                if i > 0 {
-                    out.push('\n');
+        for rank in 0..8 {
+            writeln!(f, "+---+---+---+---+---+---+---+---+")?;
+            write!(f, "|")?;
+            for file in 0..8 {
+                if let Some(p) =
+                    self.piece_at_index(BitBoardCollection::encode_tile(file, 7 - rank))
+                {
+                    write!(f, " {} |", p.encode_fen())?;
+                } else {
+                    // empty
+                    write!(f, "   |")?;
                 }
-                out.extend("+---+---+---+---+---+---+---+---+".chars());
-                out.push('\n');
-                out.push('|');
             }
-
-            if let Some(p) = self.0[i] {
-                out.push(' ');
-                out.push(p.encode_fen());
-                out.extend(" |".chars());
-            } else {
-                out.extend("   |".chars());
-            }
-
-            if i % 8 == 7 {
-                out.push(' ');
-                out.extend((8 - (i / 8)).to_string().chars());
-            }
+            writeln!(f)?;
         }
-        out.extend("\n+---+---+---+---+---+---+---+---+\n".chars());
-        out.extend("  a   b   c   d   e   f   g   h".chars());
+        writeln!(f, "+---+---+---+---+---+---+---+---+")?;
 
-        write!(f, "{}", out)
+        Ok(())
     }
 }
+struct Move {
+    from: usize,
+    to: usize,
+}
 
+// Basically just FEN
 struct Game {
-    board: Board,
+    board_collection: BitBoardCollection,
     white_turn: bool,
+    en_passant_square: Option<u8>,
 }
 
 impl Game {
     fn new() -> Self {
         Self {
-            board: Board::from_fen(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+            board_collection: BitBoardCollection::from_fen(
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             ),
             white_turn: true,
+            en_passant_square: None,
         }
-    }
-
-    fn try_move(&mut self, from: u8, to: u8) -> bool {
-        let from_piece = self.board.0[from as usize];
-        let to_piece = self.board.0[to as usize];
-
-        println!("{:?} {:?}", from_piece, to_piece);
-
-        if from_piece.is_none()
-            || from_piece.is_some()
-                && (from_piece.unwrap().color == Color::White) != self.white_turn
-            || (from_piece.is_some()
-                && to_piece.is_some()
-                && from_piece.unwrap().color == to_piece.unwrap().color)
-        {
-            return false;
-        }
-
-        // TODO: Actual piece move logic
-
-        self.board.0[from as usize] = None;
-        self.board.0[to as usize] = from_piece;
-        self.white_turn = !self.white_turn;
-
-        return true;
     }
 }
 fn clear() {
@@ -190,8 +292,23 @@ fn main() {
 
     loop {
         clear();
-        println!("{}", game.board);
+        for c in 0..2 {
+            for k in 0..6 {
+                let piece = ChessPiece {
+                    color: c.try_into().unwrap(),
+                    kind: k.try_into().unwrap(),
+                };
+
+                println!(
+                    "{}\n{}",
+                    piece.encode_fen(),
+                    game.board_collection.get_board(&piece)
+                );
+            }
+        }
+
         println!("{}", game.white_turn);
+        println!("{}", game.board_collection);
         let input = take_input();
 
         if input.starts_with("mv") {
@@ -221,12 +338,10 @@ fn main() {
                 .unwrap() as u8;
             let to_rank = to.chars().nth(1).unwrap().to_digit(10).unwrap_or(0) as u8 - 1;
 
-            let from_tile = Board::encode_tile(from_file, from_rank);
-            let to_tile = Board::encode_tile(to_file, to_rank);
+            let from_tile = BC::encode_tile(from_file, from_rank);
+            let to_tile = BC::encode_tile(to_file, to_rank);
 
             println!("{} {}", from_tile, to_tile);
-
-            game.try_move(from_tile, to_tile);
         }
     }
 }
