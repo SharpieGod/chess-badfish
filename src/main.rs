@@ -228,6 +228,12 @@ impl BitBoardCollection {
     fn decode_tile(tile: usize) -> (u8, u8) {
         (tile as u8 % 8, 7 - (tile as u8 / 8))
     }
+
+    fn pawn_moves(&self, index: usize) -> HashSet<Move> {
+        let mut move_set = HashSet::new();
+
+        move_set
+    }
 }
 
 impl Display for BitBoardCollection {
