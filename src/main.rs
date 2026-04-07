@@ -166,9 +166,9 @@ impl Not for BitBoard {
 }
 impl Display for BitBoard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for rank in 0..8 {
+        for rank in (0..8).rev() {
             for file in 0..8 {
-                let index = BC::encode_tile(file, 7 - rank);
+                let index = BC::encode_tile(file, rank);
 
                 let c = if self.contains(index) { '#' } else { '/' };
 
@@ -269,23 +269,21 @@ impl BitBoardCollection {
     }
 
     fn encode_tile(file: u8, rank: u8) -> u8 {
-        ((7 - rank) * 8 + file)
+        (rank * 8 + file)
     }
 
     fn decode_tile(index: u8) -> (u8, u8) {
-        (index as u8 % 8, 7 - (index as u8 / 8))
+        (index as u8 % 8, index as u8 / 8)
     }
 }
 
 impl Display for BitBoardCollection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for rank in 0..8 {
+        for rank in (0..8).rev() {
             writeln!(f, "+---+---+---+---+---+---+---+---+")?;
             write!(f, "|")?;
             for file in 0..8 {
-                if let Some(p) =
-                    self.piece_at_index(BitBoardCollection::encode_tile(file, 7 - rank))
-                {
+                if let Some(p) = self.piece_at_index(BitBoardCollection::encode_tile(file, rank)) {
                     write!(f, " {} |", p.encode_fen())?;
                 } else {
                     // empty
@@ -312,16 +310,16 @@ impl Game {
         Self {
             board_collection: BitBoardCollection::from_fen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                // "r2qk2r/2p2ppp/p1n1bn2/1p1pp3/3P4/2N1PN2/PPP1BPPP/R2QK2R w KQkq - 0 9",
             ),
             white_turn: true,
             en_passant_square: None,
         }
     }
     fn pawn_moves(&self, index: u8, color: Color) -> HashSet<u8> {
-        let pawn_capture;
         let (forward, start_rank_range) = match color {
-            Color::White => (8, 48..=55),
-            Color::Black => (-8, 8..=15),
+            Color::Black => (-8, 48..=55),
+            Color::White => (8, 8..=15),
         };
 
         let single = BitBoard(0b1 << index as i16 + forward) & !self.board_collection.occupied();
@@ -331,23 +329,27 @@ impl Game {
             BitBoard(0)
         };
 
-        if let Some(en_passant_index) = self.en_passant_square {
-            pawn_capture = BitBoard(0b101 << index - 1 + 8)
-                & (self.board_collection.occupied_color(!color)
-                    | BitBoard(0b1 << en_passant_index));
-        } else {
-            pawn_capture = BitBoard(0b101 << index as i16 - 1 + forward)
-                & self.board_collection.occupied_color(!color)
+        let (file, _) = BC::decode_tile(index);
+        let mut captures = BitBoard(0);
+        if file > 0 {
+            captures.0 |= 1 << (index as i16 - 1 + forward)
         }
-        println!(
-            "{} {:?}",
-            self.board_collection.occupied_color(!color),
-            !color
-        );
-        println!("{}", BitBoard(1 << index));
-        println!("{}", pawn_capture);
-        (single | pawn_capture | double_step).break_down()
+
+        if file < 7 {
+            captures.0 |= 1 << (index as i16 + 1 + forward)
+        }
+
+        let en_passant = self
+            .en_passant_square
+            .map(|ep| BitBoard(1 << ep))
+            .unwrap_or(BitBoard(0));
+
+        // Ad en_passant as a fake ocupied piece
+        captures = captures & (self.board_collection.occupied_color(!color) | en_passant);
+
+        (single | captures | double_step).break_down()
     }
+
     fn king_moves(&self, index: u8, color: Color) -> HashSet<u8> {
         HashSet::new()
     }
@@ -386,7 +388,7 @@ fn main() {
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
-        game.pawn_moves(55, Color::Black);
+        game.pawn_moves(8, Color::White);
         let input = take_input();
 
         if input.starts_with("mv") {
