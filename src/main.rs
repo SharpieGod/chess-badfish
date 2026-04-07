@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display},
     io,
+    ops::{BitAnd, BitOr, Not},
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -34,6 +35,17 @@ impl TryFrom<usize> for PieceKind {
 enum Color {
     White,
     Black,
+}
+
+impl Not for Color {
+    type Output = Color;
+
+    fn not(self) -> Self::Output {
+        match self {
+            Color::White => Color::Black,
+            Color::Black => Color::White,
+        }
+    }
 }
 
 impl TryFrom<usize> for Color {
@@ -110,10 +122,10 @@ impl BitBoard {
             if self.0 & (1 << i) != 0 {
                 set.insert(i);
             }
-        } 
+        }
 
         set
-    }    
+    }
     fn insert(&mut self, index: u8) {
         self.0 |= 1 << index;
     }
@@ -126,7 +138,28 @@ impl BitBoard {
         self.0 & (1 << index) != 0
     }
 }
+impl BitAnd for BitBoard {
+    type Output = BitBoard;
 
+    fn bitand(self, rhs: Self) -> Self::Output {
+        BitBoard(self.0 & rhs.0)
+    }
+}
+
+impl BitOr for BitBoard {
+    type Output = BitBoard;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        BitBoard(self.0 | rhs.0)
+    }
+}
+impl Not for BitBoard {
+    type Output = BitBoard;
+
+    fn not(self) -> Self::Output {
+        BitBoard(!self.0)
+    }
+}
 impl Display for BitBoard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for rank in 0..8 {
@@ -235,15 +268,8 @@ impl BitBoardCollection {
         ((7 - rank) * 8 + file)
     }
 
-    fn decode_tile(tile: u8) -> (u8, u8) {
-        (tile as u8 % 8, 7 - (tile as u8 / 8))
-    }
-
-    fn pawn_moves(&self, index: u8) -> HashSet<u8> {
-        let (file, rank) = BitBoardCollection::decode_tile(index);
-        let rank_mask = BitBoard(0x0101010101010101);
-
-        HashSet::new()
+    fn decode_tile(index: u8) -> (u8, u8) {
+        (index as u8 % 8, 7 - (index as u8 / 8))
     }
 }
 
@@ -287,6 +313,22 @@ impl Game {
             en_passant_square: None,
         }
     }
+    fn pawn_moves(&self, index: u8, color: Color) -> HashSet<u8> {
+        let pawn_move = BitBoard(0b1 << index + 8) & !self.board_collection.occupied();
+        let pawn_capture;
+
+        if let Some(en_passant_index) = self.en_passant_square {
+            pawn_capture = BitBoard(0b101 << index - 1 + 7)
+                & (self.board_collection.occupied_color(!color)
+                    | BitBoard(0b1 << en_passant_index));
+        } else {
+            pawn_capture =
+                BitBoard(0b101 << index - 1 + 7) & self.board_collection.occupied_color(!color);
+        }
+        println!("{}", pawn_move | pawn_capture);
+
+        (pawn_move | pawn_capture).break_down()
+    }
 }
 fn clear() {
     print!("\x1B[2J\x1B[1;1H");
@@ -322,6 +364,7 @@ fn main() {
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
+        game.pawn_moves(9, Color::White);
         let input = take_input();
 
         if input.starts_with("mv") {
