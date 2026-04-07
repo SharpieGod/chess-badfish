@@ -104,6 +104,16 @@ impl ChessPiece {
 struct BitBoard(u64);
 
 impl BitBoard {
+    fn break_down(&self) -> HashSet<u8> {
+        let mut set = HashSet::new();
+        for i in 0..64 {
+            if self.0 & (1 << i) != 0 {
+                set.insert(i);
+            }
+        } 
+
+        set
+    }    
     fn insert(&mut self, index: u8) {
         self.0 |= 1 << index;
     }
@@ -230,9 +240,10 @@ impl BitBoardCollection {
     }
 
     fn pawn_moves(&self, index: u8) -> HashSet<u8> {
-        let mut move_set = HashSet::new();
+        let (file, rank) = BitBoardCollection::decode_tile(index);
+        let rank_mask = BitBoard(0x0101010101010101);
 
-        move_set
+        HashSet::new()
     }
 }
 
