@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display},
     io,
-    ops::{BitAnd, BitOr, Not},
+    ops::{BitAnd, BitOr, Not, RangeInclusive},
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -35,6 +35,21 @@ impl TryFrom<usize> for PieceKind {
 enum Color {
     White,
     Black,
+}
+
+impl Color {
+    fn pawn_forward(&self) -> i16 {
+        match self {
+            Color::White => 8,
+            Color::Black => -8,
+        }
+    }
+    fn pawn_start_rank(&self) -> RangeInclusive<u8> {
+        match self {
+            Color::White => 8..=15,
+            Color::Black => 48..=55,
+        }
+    }
 }
 
 impl Not for Color {
@@ -298,6 +313,64 @@ impl Display for BitBoardCollection {
     }
 }
 
+struct MoveGen<'a> {
+    bc: &'a BitBoardCollection,
+    en_passant: Option<u8>,
+}
+// attack = threats/protections
+// quiets = empty spaces that the piece can move to
+// captures = attack | opposite_color
+// protections = attack | same_color
+// moves = quiets | captures
+
+impl<'a> MoveGen<'a> {
+    fn new(game: &'a Game) -> Self {
+        Self {
+            bc: &game.board_collection,
+            en_passant: game.en_passant_square,
+        }
+    }
+
+    fn pawn_attacks(&self, index: u8, color: Color) -> BitBoard {
+        let forward = color.pawn_forward();
+        let (file, _) = BC::decode_tile(index);
+        let mut attacks = BitBoard(0);
+        if file > 0 {
+            attacks.0 |= 1 << (index as i16 - 1 + forward);
+        }
+
+        if file < 7 {
+            attacks.0 |= 1 << (index as i16 + 1 + forward);
+        }
+        attacks
+    }
+    fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
+        let en_passant = self
+            .en_passant
+            .map(|ep| BitBoard(1 << ep))
+            .unwrap_or(BitBoard(0));
+
+        self.pawn_attacks(index, color) & (en_passant | self.bc.occupied_color(!color))
+    }
+    fn pawn_quiets(&self, index: u8, color: Color) -> BitBoard {
+        // Pawn push seperate because pawns move differently than when they capture, pushes are moves without captures.
+        let forward = color.pawn_forward();
+        let start_rank_range = color.pawn_start_rank();
+
+        let single = BitBoard(0b1 << index as i16 + forward) & !self.bc.occupied();
+        let double = if start_rank_range.contains(&index) && !single.is_empty() {
+            BitBoard(0b1 << (index as i16 + forward * 2)) & !self.bc.occupied()
+        } else {
+            BitBoard(0)
+        };
+
+        single | double
+    }
+    fn pawn_moves(&self, index: u8, color: Color) -> BitBoard {
+        self.pawn_quiets(index, color) | self.pawn_captures(index, color)
+    }
+}
+
 // Basically just FEN
 struct Game {
     board_collection: BitBoardCollection,
@@ -316,44 +389,8 @@ impl Game {
             en_passant_square: None,
         }
     }
-    fn pawn_moves(&self, index: u8, color: Color) -> HashSet<u8> {
-        let (forward, start_rank_range) = match color {
-            Color::Black => (-8, 48..=55),
-            Color::White => (8, 8..=15),
-        };
-
-        let single = BitBoard(0b1 << index as i16 + forward) & !self.board_collection.occupied();
-        let double_step = if start_rank_range.contains(&index) && !single.is_empty() {
-            BitBoard(0b1 << (index as i16 + forward * 2)) & !self.board_collection.occupied()
-        } else {
-            BitBoard(0)
-        };
-
-        let (file, _) = BC::decode_tile(index);
-        let mut captures = BitBoard(0);
-        if file > 0 {
-            captures.0 |= 1 << (index as i16 - 1 + forward)
-        }
-
-        if file < 7 {
-            captures.0 |= 1 << (index as i16 + 1 + forward)
-        }
-
-        let en_passant = self
-            .en_passant_square
-            .map(|ep| BitBoard(1 << ep))
-            .unwrap_or(BitBoard(0));
-
-        // Ad en_passant as a fake ocupied piece
-        captures = captures & (self.board_collection.occupied_color(!color) | en_passant);
-
-        (single | captures | double_step).break_down()
-    }
-
-    fn king_moves(&self, index: u8, color: Color) -> HashSet<u8> {
-        HashSet::new()
-    }
 }
+
 fn clear() {
     print!("\x1B[2J\x1B[1;1H");
 }
@@ -388,7 +425,6 @@ fn main() {
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
-        game.pawn_moves(8, Color::White);
         let input = take_input();
 
         if input.starts_with("mv") {
