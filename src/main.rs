@@ -50,6 +50,12 @@ impl Color {
             Color::Black => 48..=55,
         }
     }
+    fn pawn_promo_rank(&self) -> RangeInclusive<u8> {
+        match self {
+            Color::White => 56..=63,
+            Color::Black => 0..=7,
+        }
+    }
 }
 
 impl Not for Color {
@@ -337,7 +343,19 @@ struct Move {
     to: u8,
     flags: MoveFlags,
 }
+impl Move {
+    fn new(from: u8, to: u8, flags: MoveFlags) -> Self {
+        Self { from, to, flags }
+    }
 
+    fn modified(&self, to: u8, flags: MoveFlags) -> Self {
+        Self {
+            from: self.from,
+            to,
+            flags,
+        }
+    }
+}
 bitflags::bitflags! {
     pub struct MoveFlags: u16 {
         const QUIET            = 0;
@@ -385,9 +403,10 @@ struct MoveGen<'a> {
 }
 // attack = threats/protections
 // quiets = empty spaces that the piece can move to
-// captures = attack | opposite_color
-// protections = attack | same_color
+// captures = attack & opposite_color
+// protections = attack & same_color
 // moves = quiets | captures
+// lists need to be split up in quiets and captures, pawns have special double push for en_passant tracking
 impl<'a> MoveGen<'a> {
     fn new(game: &'a Game) -> Self {
         Self {
@@ -464,6 +483,7 @@ impl<'a> MoveGen<'a> {
         attacks
     }
 
+    // -- Pawn --
     fn pawn_attacks(&self, index: u8, color: Color) -> BitBoard {
         let forward = color.pawn_forward();
         let (file, _) = BC::decode_tile(index);
@@ -477,8 +497,7 @@ impl<'a> MoveGen<'a> {
         }
         attacks
     }
-    // -- Pawn --
-    fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
+    fn pawn_en_passant(&self, index: u8, color: Color) -> BitBoard {
         // En passant is a capture, but also a threat.
 
         let en_passant = self
@@ -486,14 +505,24 @@ impl<'a> MoveGen<'a> {
             .map(|ep| BitBoard(1 << ep))
             .unwrap_or(BitBoard(0));
 
-        self.pawn_attacks(index, color) & (en_passant | self.bc.occupied_color(!color))
+        en_passant
+    }
+    fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
+        self.pawn_attacks(index, color)
+            & (self.pawn_en_passant(index, color) | self.bc.occupied_color(!color))
+    }
+    fn pawn_single(&self, index: u8, color: Color) -> BitBoard {
+        let forward = color.pawn_forward();
+        let single = BitBoard(0b1 << index as i16 + forward) & !self.bc.occupied();
+
+        single
     }
     fn pawn_quiets(&self, index: u8, color: Color) -> BitBoard {
         // Pawn push seperate because pawns move differently than when they capture, pushes are moves without captures.
-        let forward = color.pawn_forward();
         let start_rank_range = color.pawn_start_rank();
+        let forward = color.pawn_forward();
+        let single = self.pawn_single(index, color);
 
-        let single = BitBoard(0b1 << index as i16 + forward) & !self.bc.occupied();
         let double = if start_rank_range.contains(&index) && !single.is_empty() {
             BitBoard(0b1 << (index as i16 + forward * 2)) & !self.bc.occupied()
         } else {
@@ -504,6 +533,68 @@ impl<'a> MoveGen<'a> {
     }
     fn pawn_moves(&self, index: u8, color: Color) -> BitBoard {
         self.pawn_quiets(index, color) | self.pawn_captures(index, color)
+    }
+
+    fn pawn_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
+        let base_move = Move::new(index, 0, MoveFlags::QUIET);
+        let mut moves: Vec<Move> = Vec::new();
+        let promo_rank = color.pawn_promo_rank();
+
+        let mut singles = self.pawn_single(index, color);
+
+        while let Some(to) = singles.pop_lsb() {
+            if !promo_rank.contains(&to) {
+                moves.push(base_move.modified(to, MoveFlags::QUIET));
+            } else {
+                for t in [
+                    MoveFlags::PROMOTE_Q,
+                    MoveFlags::PROMOTE_R,
+                    MoveFlags::PROMOTE_N,
+                    MoveFlags::PROMOTE_B,
+                ] {
+                    moves.push(base_move.modified(to, MoveFlags::QUIET | t))
+                }
+            }
+        }
+
+        // Pawn quiets without single pushes are double pushes
+        let mut doubles = self.pawn_quiets(index, color) & !self.pawn_single(index, color);
+
+        while let Some(to) = doubles.pop_lsb() {
+            if !promo_rank.contains(&to) {
+                moves.push(base_move.modified(to, MoveFlags::QUIET | MoveFlags::DOUBLE_PAWN_PUSH));
+            } else {
+                for t in [
+                    MoveFlags::PROMOTE_Q,
+                    MoveFlags::PROMOTE_R,
+                    MoveFlags::PROMOTE_N,
+                    MoveFlags::PROMOTE_B,
+                ] {
+                    moves.push(
+                        base_move.modified(to, MoveFlags::QUIET | t | MoveFlags::DOUBLE_PAWN_PUSH),
+                    )
+                }
+            }
+        }
+
+        let mut captures = self.pawn_captures(index, color);
+
+        while let Some(to) = captures.pop_lsb() {
+            if !promo_rank.contains(&to) {
+                moves.push(base_move.modified(to, MoveFlags::CAPTURE));
+            } else {
+                for t in [
+                    MoveFlags::PROMOTE_Q,
+                    MoveFlags::PROMOTE_R,
+                    MoveFlags::PROMOTE_N,
+                    MoveFlags::PROMOTE_B,
+                ] {
+                    moves.push(base_move.modified(to, MoveFlags::CAPTURE | t))
+                }
+            }
+        }
+
+        moves
     }
 
     // -- Knight --
@@ -573,9 +664,12 @@ impl<'a> MoveGen<'a> {
             let mut new_file = file as i8;
             let mut new_rank = rank as i8;
 
-            while (0..8).contains(&new_file) && (0..8).contains(&new_rank) {
+            loop {
                 new_file += f;
                 new_rank += r;
+                if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
+                    break;
+                }
 
                 let tile = BC::encode_tile(new_file as u8, new_rank as u8);
                 attack.0 |= 1 << tile;
@@ -607,10 +701,13 @@ impl<'a> MoveGen<'a> {
             let mut new_file = file as i8;
             let mut new_rank = rank as i8;
 
-            while (0..8).contains(&new_file) && (0..8).contains(&new_rank) {
+            loop {
                 new_file += f;
                 new_rank += r;
 
+                if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
+                    break;
+                }
                 let tile = BC::encode_tile(new_file as u8, new_rank as u8);
                 attack.0 |= 1 << tile;
 
@@ -644,8 +741,8 @@ impl Game {
     fn new() -> Self {
         Self {
             board_collection: BitBoardCollection::from_fen(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                // "r2qk2r/2p2ppp/p1n1bn2/1p1pp3/3P4/2N1PN2/PPP1BPPP/R2QK2R w KQkq - 0 9",
+                // "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "r2qk2r/2p2ppp/p1n1bn2/1p1pp3/3P4/2N1PN2/PPP1BPPP/R2QK2R w KQkq - 0 9",
             ),
             white_turn: true,
             en_passant_square: None,
@@ -687,6 +784,11 @@ fn main() {
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
+        // let move_gen = MoveGen::new(&game);
+        // println!(
+        //     "{}",
+        //     move_gen.all_attacked_by(Color::White) & move_gen.bc.occupied_color(Color::Black)
+        // );
         let input = take_input();
 
         if input.starts_with("mv") {
