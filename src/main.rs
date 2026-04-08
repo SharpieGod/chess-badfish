@@ -156,6 +156,18 @@ impl BitBoard {
     fn is_empty(&self) -> bool {
         self.0 == 0
     }
+
+    fn pop_lsb(&mut self) -> Option<u8> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let lsb = self.0.trailing_zeros() as u8;
+
+        // bit magic to remove least significant bit
+        self.0 &= self.0 - 1;
+        Some(lsb)
+    }
 }
 impl BitAnd for BitBoard {
     type Output = BitBoard;
@@ -199,6 +211,7 @@ impl Display for BitBoard {
     }
 }
 
+#[derive(Clone, Copy)]
 struct BitBoardCollection {
     // 6 pieces, 2 colours
     piece_boards: [[BitBoard; 6]; 2],
@@ -213,20 +226,24 @@ impl BitBoardCollection {
             piece_boards: [[BitBoard(0); 6]; 2],
         }
     }
-    fn get_board(&mut self, piece: &ChessPiece) -> &mut BitBoard {
+
+    fn get_board(&self, piece: &ChessPiece) -> &BitBoard {
+        &self.piece_boards[piece.color as usize][piece.kind as usize]
+    }
+    fn get_board_mut(&mut self, piece: &ChessPiece) -> &mut BitBoard {
         &mut self.piece_boards[piece.color as usize][piece.kind as usize]
     }
 
     fn insert(&mut self, index: u8, piece: &ChessPiece) {
-        self.get_board(piece).insert(index);
+        self.get_board_mut(piece).insert(index);
     }
 
     fn remove(&mut self, index: u8, piece: &ChessPiece) {
-        self.get_board(piece).remove(index);
+        self.get_board_mut(piece).remove(index);
     }
 
     fn contains(&mut self, index: u8, piece: &ChessPiece) -> bool {
-        self.get_board(piece).contains(index)
+        self.get_board_mut(piece).contains(index)
     }
 
     fn occupied_color(&self, color: Color) -> BitBoard {
@@ -313,6 +330,55 @@ impl Display for BitBoardCollection {
     }
 }
 
+// -- Moves --
+
+struct Move {
+    from: u8,
+    to: u8,
+    flags: MoveFlags,
+}
+
+bitflags::bitflags! {
+    pub struct MoveFlags: u16 {
+        const QUIET            = 0;
+        const CAPTURE          = 1 << 0;
+        const DOUBLE_PAWN_PUSH = 1 << 1;
+        const EN_PASSANT       = 1 << 2;
+        const CASTLE_KING      = 1 << 3;
+        const CASTLE_QUEEN     = 1 << 4;
+
+        const PROMOTE_N        = 1 << 5;
+        const PROMOTE_B        = 1 << 6;
+        const PROMOTE_R        = 1 << 7;
+        const PROMOTE_Q        = 1 << 8;
+    }
+}
+
+static KNIGHT_DIRECTIONS: [(i8, i8); 8] = [
+    (2, 1),
+    (2, -1),
+    (1, 2),
+    (-1, 2),
+    (-2, 1),
+    (-2, -1),
+    (1, -2),
+    (-1, -2),
+];
+
+static KING_DIRECTIONS: [(i8, i8); 8] = [
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+];
+
+static ROOK_DIRECTIONS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+static BISHOP_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (-1, 1), (-1, -1), (1, -1)];
+
 struct MoveGen<'a> {
     bc: &'a BitBoardCollection,
     en_passant: Option<u8>,
@@ -322,13 +388,80 @@ struct MoveGen<'a> {
 // captures = attack | opposite_color
 // protections = attack | same_color
 // moves = quiets | captures
-
 impl<'a> MoveGen<'a> {
     fn new(game: &'a Game) -> Self {
         Self {
             bc: &game.board_collection,
             en_passant: game.en_passant_square,
         }
+    }
+
+    fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
+        let color = piece.color;
+        match piece.kind {
+            PieceKind::Pawn => self.pawn_attacks(index, color),
+            PieceKind::Knight => self.knight_attacks(index, color),
+            PieceKind::Bishop => self.bishop_attacks(index, color),
+            PieceKind::Rook => self.rook_attacks(index, color),
+            PieceKind::Queen => self.bishop_attacks(index, color) | self.rook_attacks(index, color),
+            PieceKind::King => self.king_attacks(index, color),
+        }
+    }
+
+    fn piece_captures(&self, index: u8, piece: ChessPiece) -> BitBoard {
+        let color = piece.color;
+        match piece.kind {
+            PieceKind::Pawn => self.pawn_captures(index, color),
+            PieceKind::Knight => self.knight_captures(index, color),
+            PieceKind::Bishop => self.bishop_captures(index, color),
+            PieceKind::Rook => self.rook_captures(index, color),
+            PieceKind::Queen => {
+                self.bishop_captures(index, color) | self.rook_captures(index, color)
+            }
+            PieceKind::King => self.king_captures(index, color),
+        }
+    }
+
+    fn piece_quiets(&self, index: u8, piece: ChessPiece) -> BitBoard {
+        let color = piece.color;
+        match piece.kind {
+            PieceKind::Pawn => self.pawn_quiets(index, color),
+            PieceKind::Knight => self.knight_quiets(index, color),
+            PieceKind::Bishop => self.bishop_quiets(index, color),
+            PieceKind::Rook => self.rook_quiets(index, color),
+            PieceKind::Queen => self.bishop_quiets(index, color) | self.rook_quiets(index, color),
+            PieceKind::King => self.king_quiets(index, color),
+        }
+    }
+
+    fn piece_moves(&self, index: u8, piece: ChessPiece) -> BitBoard {
+        let color = piece.color;
+        match piece.kind {
+            PieceKind::Pawn => self.pawn_moves(index, color),
+            PieceKind::Knight => self.knight_moves(index, color),
+            PieceKind::Bishop => self.bishop_moves(index, color),
+            PieceKind::Rook => self.rook_moves(index, color),
+            PieceKind::Queen => self.bishop_moves(index, color) | self.rook_moves(index, color),
+            PieceKind::King => self.king_moves(index, color),
+        }
+    }
+
+    fn all_attacked_by(&self, color: Color) -> BitBoard {
+        let mut attacks = BitBoard(0);
+
+        for kind in (0..6) {
+            let piece = ChessPiece {
+                kind: kind.try_into().unwrap(),
+                color,
+            };
+            let mut bb = *self.bc.get_board(&piece);
+
+            while let Some(index) = bb.pop_lsb() {
+                attacks.0 |= self.piece_attacks(index, piece).0;
+            }
+        }
+
+        attacks
     }
 
     fn pawn_attacks(&self, index: u8, color: Color) -> BitBoard {
@@ -344,6 +477,7 @@ impl<'a> MoveGen<'a> {
         }
         attacks
     }
+    // -- Pawn --
     fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
         // En passant is a capture, but also a threat.
 
@@ -371,10 +505,12 @@ impl<'a> MoveGen<'a> {
     fn pawn_moves(&self, index: u8, color: Color) -> BitBoard {
         self.pawn_quiets(index, color) | self.pawn_captures(index, color)
     }
-    fn knight_attack(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
+
+    // -- Knight --
+    fn knight_attacks(&self, index: u8, color: Color) -> BitBoard {
         let (file, rank) = BC::decode_tile(index);
         let mut attack = BitBoard(0);
-        for (forward, right) in directions {
+        for (forward, right) in KNIGHT_DIRECTIONS {
             let new_file = file as i8 + forward;
             let new_rank = rank as i8 + right;
 
@@ -387,15 +523,113 @@ impl<'a> MoveGen<'a> {
 
         attack
     }
-    fn knight_captures(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
-        self.knight_attack(index, color, directions) & self.bc.occupied_color(!color)
+    fn knight_captures(&self, index: u8, color: Color) -> BitBoard {
+        self.knight_attacks(index, color) & self.bc.occupied_color(!color)
     }
-    fn knight_quiets(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
-        self.knight_attack(index, color, directions) & !self.bc.occupied()
+    fn knight_quiets(&self, index: u8, color: Color) -> BitBoard {
+        self.knight_attacks(index, color) & !self.bc.occupied()
     }
-    fn knight_moves(&self, index: u8, color: Color, directions: &[(i8, i8)]) -> BitBoard {
-        self.knight_quiets(index, color, directions)
-            | self.knight_captures(index, color, directions)
+    fn knight_moves(&self, index: u8, color: Color) -> BitBoard {
+        self.knight_quiets(index, color) | self.knight_captures(index, color)
+    }
+
+    // -- King --
+    fn king_attacks(&self, index: u8, color: Color) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+
+        for (f, r) in KING_DIRECTIONS {
+            let new_file = file as i8 + f;
+            let new_rank = rank as i8 + r;
+
+            if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
+                continue;
+            }
+
+            attack.0 |= 1 << BC::encode_tile(new_file as u8, new_rank as u8)
+        }
+
+        attack
+    }
+    fn king_captures(&self, index: u8, color: Color) -> BitBoard {
+        self.king_attacks(index, color)
+            & self.bc.occupied_color(!color)
+            & !(self.all_attacked_by(!color))
+    }
+    fn king_quiets(&self, index: u8, color: Color) -> BitBoard {
+        // King cant move to an attacked square
+        self.king_attacks(index, color) & !(self.all_attacked_by(!color)) & !self.bc.occupied()
+    }
+    fn king_moves(&self, index: u8, color: Color) -> BitBoard {
+        self.king_quiets(index, color) | self.king_captures(index, color)
+    }
+
+    // -- Rook --
+    fn rook_attacks(&self, index: u8, color: Color) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+
+        for (f, r) in ROOK_DIRECTIONS {
+            let mut new_file = file as i8;
+            let mut new_rank = rank as i8;
+
+            while (0..8).contains(&new_file) && (0..8).contains(&new_rank) {
+                new_file += f;
+                new_rank += r;
+
+                let tile = BC::encode_tile(new_file as u8, new_rank as u8);
+                attack.0 |= 1 << tile;
+
+                if self.bc.occupied().contains(tile) {
+                    break;
+                }
+            }
+        }
+
+        attack
+    }
+    fn rook_captures(&self, index: u8, color: Color) -> BitBoard {
+        self.rook_attacks(index, color) & self.bc.occupied_color(!color)
+    }
+    fn rook_quiets(&self, index: u8, color: Color) -> BitBoard {
+        self.rook_attacks(index, color) & !self.bc.occupied()
+    }
+    fn rook_moves(&self, index: u8, color: Color) -> BitBoard {
+        self.rook_quiets(index, color) | self.rook_captures(index, color)
+    }
+
+    // -- Bishop --
+    fn bishop_attacks(&self, index: u8, color: Color) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+
+        for (f, r) in BISHOP_DIRECTIONS {
+            let mut new_file = file as i8;
+            let mut new_rank = rank as i8;
+
+            while (0..8).contains(&new_file) && (0..8).contains(&new_rank) {
+                new_file += f;
+                new_rank += r;
+
+                let tile = BC::encode_tile(new_file as u8, new_rank as u8);
+                attack.0 |= 1 << tile;
+
+                if self.bc.occupied().contains(tile) {
+                    break;
+                }
+            }
+        }
+
+        attack
+    }
+    fn bishop_captures(&self, index: u8, color: Color) -> BitBoard {
+        self.bishop_attacks(index, color) & self.bc.occupied_color(!color)
+    }
+    fn bishop_quiets(&self, index: u8, color: Color) -> BitBoard {
+        self.bishop_attacks(index, color) & !self.bc.occupied()
+    }
+    fn bishop_moves(&self, index: u8, color: Color) -> BitBoard {
+        self.bishop_quiets(index, color) | self.bishop_captures(index, color)
     }
 }
 
