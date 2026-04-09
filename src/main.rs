@@ -328,9 +328,11 @@ impl Display for BitBoardCollection {
                     write!(f, "   |")?;
                 }
             }
+            write!(f, " {}", rank + 1)?;
             writeln!(f)?;
         }
         writeln!(f, "+---+---+---+---+---+---+---+---+")?;
+        writeln!(f, "  a   b   c   d   e   f   g   h  ")?;
 
         Ok(())
     }
@@ -338,6 +340,7 @@ impl Display for BitBoardCollection {
 
 // -- Moves --
 
+#[derive(Debug)]
 struct Move {
     from: u8,
     to: u8,
@@ -357,6 +360,7 @@ impl Move {
     }
 }
 bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug)]
     pub struct MoveFlags: u16 {
         const QUIET            = 0;
         const CAPTURE          = 1 << 0;
@@ -400,6 +404,10 @@ static BISHOP_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (-1, 1), (-1, -1), (1, -1)];
 struct MoveGen<'a> {
     bc: &'a BitBoardCollection,
     en_passant: Option<u8>,
+    Q: bool,
+    K: bool,
+    q: bool,
+    k: bool,
 }
 // attack = threats/protections
 // quiets = empty spaces that the piece can move to
@@ -412,7 +420,30 @@ impl<'a> MoveGen<'a> {
         Self {
             bc: &game.board_collection,
             en_passant: game.en_passant_square,
+            K: true,
+            Q: true,
+            q: true,
+            k: true,
         }
+    }
+
+    fn pseudo_legal_moves(&self, color: Color) -> Vec<Move> {
+        let mut moves = Vec::new();
+
+        for kind in 0..6 {
+            let piece = ChessPiece {
+                kind: kind.try_into().unwrap(),
+                color,
+            };
+
+            let mut bb = *self.bc.get_board(&piece);
+
+            while let Some(index) = bb.pop_lsb() {
+                moves.extend(self.piece_moves_list(index, piece));
+            }
+        }
+
+        moves
     }
 
     fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
@@ -465,6 +496,22 @@ impl<'a> MoveGen<'a> {
         }
     }
 
+    fn piece_moves_list(&self, index: u8, piece: ChessPiece) -> Vec<Move> {
+        let color = piece.color;
+        match piece.kind {
+            PieceKind::Pawn => self.pawn_moves_list(index, color),
+            PieceKind::Knight => self.knight_moves_list(index, color),
+            PieceKind::Bishop => self.bishop_moves_list(index, color),
+            PieceKind::Rook => self.rook_moves_list(index, color),
+            PieceKind::Queen => {
+                let mut moves = self.bishop_moves_list(index, color);
+                moves.extend(self.rook_moves_list(index, color));
+                moves
+            }
+            PieceKind::King => self.king_moves_list(index, color),
+        }
+    }
+
     fn all_attacked_by(&self, color: Color) -> BitBoard {
         let mut attacks = BitBoard(0);
 
@@ -481,6 +528,25 @@ impl<'a> MoveGen<'a> {
         }
 
         attacks
+    }
+
+    fn basic_moves_list(&self, index: u8, piece: ChessPiece) -> Vec<Move> {
+        let mut moves = Vec::new();
+        let base_move = Move::new(index, 0, MoveFlags::empty());
+
+        let mut quiets = self.piece_quiets(index, piece);
+
+        while let Some(to) = quiets.pop_lsb() {
+            moves.push(base_move.modified(to, MoveFlags::QUIET));
+        }
+
+        let mut captures = self.piece_captures(index, piece);
+
+        while let Some(to) = captures.pop_lsb() {
+            moves.push(base_move.modified(to, MoveFlags::CAPTURE));
+        }
+
+        moves
     }
 
     // -- Pawn --
@@ -513,7 +579,7 @@ impl<'a> MoveGen<'a> {
     }
     fn pawn_single(&self, index: u8, color: Color) -> BitBoard {
         let forward = color.pawn_forward();
-        let single = BitBoard(0b1 << index as i16 + forward) & !self.bc.occupied();
+        let single = BitBoard(0b1 << (index as i16 + forward)) & !self.bc.occupied();
 
         single
     }
@@ -531,12 +597,13 @@ impl<'a> MoveGen<'a> {
 
         single | double
     }
+
     fn pawn_moves(&self, index: u8, color: Color) -> BitBoard {
         self.pawn_quiets(index, color) | self.pawn_captures(index, color)
     }
 
     fn pawn_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
-        let base_move = Move::new(index, 0, MoveFlags::QUIET);
+        let base_move = Move::new(index, 0, MoveFlags::empty());
         let mut moves: Vec<Move> = Vec::new();
         let promo_rank = color.pawn_promo_rank();
 
@@ -561,27 +628,21 @@ impl<'a> MoveGen<'a> {
         let mut doubles = self.pawn_quiets(index, color) & !self.pawn_single(index, color);
 
         while let Some(to) = doubles.pop_lsb() {
-            if !promo_rank.contains(&to) {
-                moves.push(base_move.modified(to, MoveFlags::QUIET | MoveFlags::DOUBLE_PAWN_PUSH));
-            } else {
-                for t in [
-                    MoveFlags::PROMOTE_Q,
-                    MoveFlags::PROMOTE_R,
-                    MoveFlags::PROMOTE_N,
-                    MoveFlags::PROMOTE_B,
-                ] {
-                    moves.push(
-                        base_move.modified(to, MoveFlags::QUIET | t | MoveFlags::DOUBLE_PAWN_PUSH),
-                    )
-                }
-            }
+            moves.push(base_move.modified(to, MoveFlags::QUIET | MoveFlags::DOUBLE_PAWN_PUSH));
         }
 
         let mut captures = self.pawn_captures(index, color);
 
         while let Some(to) = captures.pop_lsb() {
+            let is_en_passant = self.en_passant == Some(to);
+            let ep = if is_en_passant {
+                MoveFlags::EN_PASSANT
+            } else {
+                MoveFlags::empty()
+            };
+
             if !promo_rank.contains(&to) {
-                moves.push(base_move.modified(to, MoveFlags::CAPTURE));
+                moves.push(base_move.modified(to, MoveFlags::CAPTURE | ep));
             } else {
                 for t in [
                     MoveFlags::PROMOTE_Q,
@@ -589,7 +650,7 @@ impl<'a> MoveGen<'a> {
                     MoveFlags::PROMOTE_N,
                     MoveFlags::PROMOTE_B,
                 ] {
-                    moves.push(base_move.modified(to, MoveFlags::CAPTURE | t))
+                    moves.push(base_move.modified(to, MoveFlags::CAPTURE | t | ep))
                 }
             }
         }
@@ -623,6 +684,15 @@ impl<'a> MoveGen<'a> {
     fn knight_moves(&self, index: u8, color: Color) -> BitBoard {
         self.knight_quiets(index, color) | self.knight_captures(index, color)
     }
+    fn knight_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
+        self.basic_moves_list(
+            index,
+            ChessPiece {
+                kind: PieceKind::Knight,
+                color,
+            },
+        )
+    }
 
     // -- King --
     fn king_attacks(&self, index: u8, color: Color) -> BitBoard {
@@ -653,6 +723,16 @@ impl<'a> MoveGen<'a> {
     }
     fn king_moves(&self, index: u8, color: Color) -> BitBoard {
         self.king_quiets(index, color) | self.king_captures(index, color)
+    }
+
+    fn king_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
+        self.basic_moves_list(
+            index,
+            ChessPiece {
+                kind: PieceKind::King,
+                color,
+            },
+        )
     }
 
     // -- Rook --
@@ -691,6 +771,15 @@ impl<'a> MoveGen<'a> {
     fn rook_moves(&self, index: u8, color: Color) -> BitBoard {
         self.rook_quiets(index, color) | self.rook_captures(index, color)
     }
+    fn rook_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
+        self.basic_moves_list(
+            index,
+            ChessPiece {
+                kind: PieceKind::Rook,
+                color,
+            },
+        )
+    }
 
     // -- Bishop --
     fn bishop_attacks(&self, index: u8, color: Color) -> BitBoard {
@@ -728,6 +817,17 @@ impl<'a> MoveGen<'a> {
     fn bishop_moves(&self, index: u8, color: Color) -> BitBoard {
         self.bishop_quiets(index, color) | self.bishop_captures(index, color)
     }
+    fn bishop_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
+        self.basic_moves_list(
+            index,
+            ChessPiece {
+                kind: PieceKind::Bishop,
+                color,
+            },
+        )
+    }
+
+    // Queen is bishop | rook
 }
 
 // Basically just FEN
@@ -746,6 +846,15 @@ impl Game {
             ),
             white_turn: true,
             en_passant_square: None,
+        }
+    }
+
+    fn make_move(&mut self, m: Move) {
+        let piece_from = self.board_collection.piece_at_index(m.from).unwrap();
+
+        if !m.flags.contains(MoveFlags::CAPTURE) {
+            self.board_collection.remove(m.from, &piece_from);
+            self.board_collection.insert(m.to, &piece_from);
         }
     }
 }
@@ -784,12 +893,45 @@ fn main() {
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
-        // let move_gen = MoveGen::new(&game);
+        let move_gen = MoveGen::new(&game);
         // println!(
         //     "{}",
         //     move_gen.all_attacked_by(Color::White) & move_gen.bc.occupied_color(Color::Black)
         // );
+
         let input = take_input();
+
+        if input.starts_with("d") {
+            let parts = input.split_whitespace().collect::<Vec<&str>>();
+
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let space = parts[1];
+
+            if space.len() != 2 {
+                continue;
+            }
+
+            let files = vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+            let file = files
+                .iter()
+                .position(|&c| c == space.chars().nth(0).unwrap())
+                .unwrap() as u8;
+            let rank = space.chars().nth(1).unwrap().to_digit(10).unwrap_or(0) as u8 - 1;
+            let index = BC::encode_tile(file, rank);
+            let maybe_piece = game.board_collection.piece_at_index(index);
+
+            if let Some(piece) = maybe_piece {
+                clear();
+                println!(
+                    "{}\npress enter to continue",
+                    move_gen.piece_moves(index, piece)
+                );
+                take_input();
+            }
+        }
 
         if input.starts_with("mv") {
             let parts = input.split_whitespace().collect::<Vec<&str>>();
