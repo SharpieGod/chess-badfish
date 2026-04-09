@@ -3,6 +3,7 @@ use std::{
     fmt::{self, Display},
     io, mem,
     ops::{BitAnd, BitOr, Not, RangeInclusive},
+    time::Instant,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -373,6 +374,8 @@ bitflags::bitflags! {
         const PROMOTE_B        = 1 << 6;
         const PROMOTE_R        = 1 << 7;
         const PROMOTE_Q        = 1 << 8;
+
+        const IS_WHITE         = 1 << 9;
     }
 }
 
@@ -431,10 +434,10 @@ impl<'a> MoveGen<'a> {
         Self {
             bc: &game.board_collection,
             en_passant: game.en_passant_square,
-            K: true,
-            Q: true,
-            q: true,
-            k: true,
+            K: game.K,
+            Q: game.Q,
+            q: game.q,
+            k: game.k,
         }
     }
 
@@ -895,6 +898,47 @@ impl<'a> MoveGen<'a> {
     // Queen is bishop | rook
 }
 
+struct UndoMove {
+    from: u8,
+    to: u8,
+    flags: MoveFlags,
+    piece_captured: Option<ChessPiece>,
+    white_turn: bool,
+    en_passant_square: Option<ChessPiece>,
+    castling_rights_lost: Option<u8>,
+}
+
+impl UndoMove {
+    fn new(m: &Move, game: &Game) -> Self {
+        let color = if game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let piece_captured = match m.flags.contains(MoveFlags::CAPTURE) {
+            true => {
+                if !m.flags.contains(MoveFlags::EN_PASSANT) {
+                    game.board_collection.piece_at_index(m.to)
+                } else {
+                    game.board_collection
+                        .piece_at_index((m.to as i16 - color.pawn_forward()) as u8)
+                }
+            }
+            false => None,
+        };
+
+        Self {
+            from: m.from,
+            to: m.to,
+            flags: m.flags,
+            piece_captured,
+            white_turn: true,
+            en_passant_square: None,
+            castling_rights_lost: None,
+        }
+    }
+}
+
 // Basically just FEN
 #[derive(Clone, Copy)]
 struct Game {
@@ -952,7 +996,7 @@ impl Game {
         }
     }
 
-    fn make_move(&mut self, m: &Move) {
+    fn make_move(&mut self, m: &Move) -> UndoMove {
         let piece_from = self.board_collection.piece_at_index(m.from).unwrap();
         let color = if self.white_turn {
             Color::White
@@ -1063,6 +1107,7 @@ impl Game {
         }
 
         self.white_turn = !self.white_turn;
+        UndoMove::new(m, self)
     }
 }
 
@@ -1079,10 +1124,14 @@ fn take_input() -> String {
 }
 
 fn main() {
-    let game = Game::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    // let game = Game::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    let game = Game::from_fen("r2qr1k1/ppp2ppp/2n1bn2/4p3/3Pp3/2N1BN2/PPPQBPPP/R3R1K1 w - - 0 2");
 
-    for n in 0..6 {
-        println!("{}: {}", n + 1, count_positions_n_deep(n + 1, &game))
+    println!("{}\n{}", game.board_collection, game.white_turn);
+    for n in 0..7 {
+        let start = Instant::now();
+        let c = count_positions_n_deep(n + 1, &game);
+        println!("{}: {} (took {}s)", n + 1, c, start.elapsed().as_secs_f32());
     }
 
     // loop {
@@ -1179,6 +1228,7 @@ fn main() {
     // }
 }
 
+// Perft function
 fn count_positions_n_deep(n: u8, game: &Game) -> u32 {
     if n == 0 {
         return 1;
@@ -1192,7 +1242,6 @@ fn count_positions_n_deep(n: u8, game: &Game) -> u32 {
         Color::Black
     };
     let moves = move_gen.pseudo_legal_moves(color);
-
     for mv in moves.iter() {
         let mut new_game = game.clone();
         new_game.make_move(mv);
@@ -1201,6 +1250,5 @@ fn count_positions_n_deep(n: u8, game: &Game) -> u32 {
             s += count_positions_n_deep(n - 1, &new_game);
         }
     }
-
     s
 }
