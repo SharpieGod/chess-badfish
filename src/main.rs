@@ -387,6 +387,17 @@ static KNIGHT_DIRECTIONS: [(i8, i8); 8] = [
     (-1, -2),
 ];
 
+// Castling masks, king side and queen side, black and white
+const WHITE_K_EMPTY: u64 = (1 << 5) | (1 << 6);
+const WHITE_K_SAFE: u64 = (1 << 4) | (1 << 5) | (1 << 6);
+const WHITE_Q_EMPTY: u64 = (1 << 1) | (1 << 2) | (1 << 3);
+const WHITE_Q_SAFE: u64 = (1 << 2) | (1 << 3) | (1 << 4);
+
+const BLACK_K_EMPTY: u64 = (1 << 61) | (1 << 62);
+const BLACK_K_SAFE: u64 = (1 << 60) | (1 << 61) | (1 << 62);
+const BLACK_Q_EMPTY: u64 = (1 << 57) | (1 << 58) | (1 << 59);
+const BLACK_Q_SAFE: u64 = (1 << 58) | (1 << 59) | (1 << 60);
+
 static KING_DIRECTIONS: [(i8, i8); 8] = [
     (1, 0),
     (1, 1),
@@ -515,7 +526,7 @@ impl<'a> MoveGen<'a> {
     fn all_attacked_by(&self, color: Color) -> BitBoard {
         let mut attacks = BitBoard(0);
 
-        for kind in (0..6) {
+        for kind in 0..6 {
             let piece = ChessPiece {
                 kind: kind.try_into().unwrap(),
                 color,
@@ -721,18 +732,72 @@ impl<'a> MoveGen<'a> {
         // King cant move to an attacked square
         self.king_attacks(index, color) & !(self.all_attacked_by(!color)) & !self.bc.occupied()
     }
+    fn king_castling_moves(&self, index: u8, color: Color, king_side: bool) -> BitBoard {
+        let is_white = color == Color::White;
+        let comb_index = is_white as usize * 2 + king_side as usize;
+
+        let rights = [self.q, self.k, self.Q, self.K][comb_index];
+        let empty = [BLACK_Q_EMPTY, BLACK_K_EMPTY, WHITE_Q_EMPTY, WHITE_K_EMPTY][comb_index];
+        let safe = [BLACK_Q_SAFE, BLACK_K_SAFE, WHITE_Q_SAFE, WHITE_K_SAFE][comb_index];
+
+        let attacks = self.all_attacked_by(!color);
+        let occupied = self.bc.occupied();
+        let target = if king_side { index + 2 } else { index - 2 };
+
+        if rights && (safe & attacks.0) == 0 && (empty & occupied.0) == 0 {
+            BitBoard(1 << target)
+        } else {
+            BitBoard(0)
+        }
+    }
+
     fn king_moves(&self, index: u8, color: Color) -> BitBoard {
-        self.king_quiets(index, color) | self.king_captures(index, color)
+        self.king_quiets(index, color)
+            | self.king_captures(index, color)
+            | self.king_castling_moves(index, color, true)
+            | self.king_castling_moves(index, color, false)
     }
 
     fn king_moves_list(&self, index: u8, color: Color) -> Vec<Move> {
-        self.basic_moves_list(
-            index,
-            ChessPiece {
+        let mut moves = Vec::new();
+        let base_move = Move::new(index, 0, MoveFlags::empty());
+
+        let mut quiets = self.king_quiets(index, color);
+
+        while let Some(to) = quiets.pop_lsb() {
+            moves.push(base_move.modified(to, MoveFlags::QUIET));
+        }
+
+        let mut captures = self.king_captures(index, color);
+
+        while let Some(to) = captures.pop_lsb() {
+            moves.push(base_move.modified(to, MoveFlags::CAPTURE));
+        }
+
+        let mut castles_k = self.king_castling_moves(index, color, true);
+
+        while let Some(to) = castles_k.pop_lsb() {
+            moves.push(base_move.modified(to, MoveFlags::CASTLE_KING));
+        }
+
+        let mut castles_q = self.king_castling_moves(index, color, false);
+
+        while let Some(to) = castles_q.pop_lsb() {
+            moves.push(base_move.modified(to, MoveFlags::CASTLE_KING));
+        }
+
+        moves
+    }
+
+    fn is_in_check(&self, color: Color) -> bool {
+        self.bc
+            .get_board(&ChessPiece {
                 kind: PieceKind::King,
                 color,
-            },
-        )
+            })
+            .0
+            & self.all_attacked_by(!color).0
+            != 0
     }
 
     // -- Rook --
@@ -841,8 +906,8 @@ impl Game {
     fn new() -> Self {
         Self {
             board_collection: BitBoardCollection::from_fen(
-                // "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                "r2qk2r/2p2ppp/p1n1bn2/1p1pp3/3P4/2N1PN2/PPP1BPPP/R2QK2R w KQkq - 0 9",
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                // "r2qk2r/2p2ppp/p1n1bn2/1p1pp3/3P4/2N1PN2/PPP1BPPP/R2QK2R w KQkq - 0 9",
             ),
             white_turn: true,
             en_passant_square: None,
@@ -851,11 +916,76 @@ impl Game {
 
     fn make_move(&mut self, m: Move) {
         let piece_from = self.board_collection.piece_at_index(m.from).unwrap();
+        let color = if self.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        self.en_passant_square = None;
+        let is_promotion = m.flags.intersects(
+            MoveFlags::PROMOTE_Q
+                | MoveFlags::PROMOTE_R
+                | MoveFlags::PROMOTE_N
+                | MoveFlags::PROMOTE_B,
+        );
 
-        if !m.flags.contains(MoveFlags::CAPTURE) {
-            self.board_collection.remove(m.from, &piece_from);
+        self.board_collection.remove(m.from, &piece_from);
+
+        if !is_promotion {
             self.board_collection.insert(m.to, &piece_from);
         }
+
+        if m.flags.contains(MoveFlags::CAPTURE) {
+            let piece_to = self.board_collection.piece_at_index(m.to).unwrap();
+            self.board_collection.remove(m.to, &piece_to);
+        }
+
+        if is_promotion {
+            // Is promotion
+            let new_kind = if m.flags.contains(MoveFlags::PROMOTE_Q) {
+                PieceKind::Queen
+            } else if m.flags.contains(MoveFlags::PROMOTE_R) {
+                PieceKind::Rook
+            } else if m.flags.contains(MoveFlags::PROMOTE_N) {
+                PieceKind::Knight
+            } else {
+                PieceKind::Bishop
+            };
+
+            self.board_collection.insert(
+                m.to,
+                &ChessPiece {
+                    kind: new_kind,
+                    color,
+                },
+            );
+        }
+
+        if m.flags.contains(MoveFlags::DOUBLE_PAWN_PUSH) {
+            self.en_passant_square = Some((m.from as i16 - color.pawn_forward()) as u8)
+        }
+
+        if m.flags.contains(MoveFlags::CASTLE_KING) {
+            let rook_index: u8 = if self.white_turn { 7 } else { 63 };
+            let rook = ChessPiece {
+                kind: PieceKind::Rook,
+                color,
+            };
+            self.board_collection.remove(rook_index, &rook);
+            self.board_collection.insert(m.from + 1, &rook);
+        }
+
+        if m.flags.contains(MoveFlags::CASTLE_QUEEN) {
+            let rook_index: u8 = if self.white_turn { 0 } else { 55 };
+            let rook = ChessPiece {
+                kind: PieceKind::Rook,
+                color,
+            };
+            self.board_collection.remove(rook_index, &rook);
+            self.board_collection.insert(m.from - 1, &rook);
+        }
+
+        self.white_turn = !self.white_turn;
     }
 }
 
@@ -876,20 +1006,20 @@ fn main() {
 
     loop {
         clear();
-        for c in 0..2 {
-            for k in 0..6 {
-                let piece = ChessPiece {
-                    color: c.try_into().unwrap(),
-                    kind: k.try_into().unwrap(),
-                };
+        // for c in 0..2 {
+        //     for k in 0..6 {
+        //         let piece = ChessPiece {
+        //             color: c.try_into().unwrap(),
+        //             kind: k.try_into().unwrap(),
+        //         };
 
-                println!(
-                    "{}\n{}",
-                    piece.encode_fen(),
-                    game.board_collection.get_board(&piece)
-                );
-            }
-        }
+        //         println!(
+        //             "{}\n{}",
+        //             piece.encode_fen(),
+        //             game.board_collection.get_board(&piece)
+        //         );
+        //     }
+        // }
 
         println!("{}", game.white_turn);
         println!("{}", game.board_collection);
