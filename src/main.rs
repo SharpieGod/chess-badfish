@@ -976,7 +976,7 @@ impl Game {
         }
 
         if m.flags.contains(MoveFlags::CASTLE_QUEEN) {
-            let rook_index: u8 = if self.white_turn { 0 } else { 55 };
+            let rook_index: u8 = if self.white_turn { 0 } else { 56 };
             let rook = ChessPiece {
                 kind: PieceKind::Rook,
                 color,
