@@ -608,32 +608,8 @@ impl<'a> MoveGen<'a> {
         moves
     }
 
-    fn legal_moves(&self, color: Color) -> Vec<Move> {
-        let mut moves = Vec::new();
-        let mut clone_game = self.game.clone();
-
-        for mv in self.pseudo_legal_moves(color) {
-            let undo = clone_game.make_move(&mv);
-            let move_gen = MoveGen::new(&clone_game);
-            if !move_gen.is_in_check(color) {
-                moves.push(mv);
-            }
-            clone_game.undo_move(&undo);
-        }
-
-        moves
-    }
-
     fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
-        let color = piece.color;
-        match piece.kind {
-            PieceKind::Pawn => self.pawn_attacks(index, color),
-            PieceKind::Knight => self.knight_attacks(index, color),
-            PieceKind::Bishop => self.bishop_attacks(index, color),
-            PieceKind::Rook => self.rook_attacks(index, color),
-            PieceKind::Queen => self.bishop_attacks(index, color) | self.rook_attacks(index, color),
-            PieceKind::King => self.king_attacks(index, color),
-        }
+        self.game.board_collection.piece_attacks(index, piece)
     }
 
     fn piece_captures(&self, index: u8, piece: ChessPiece) -> BitBoard {
@@ -710,19 +686,6 @@ impl<'a> MoveGen<'a> {
     }
 
     // -- Pawn --
-    fn pawn_attacks(&self, index: u8, color: Color) -> BitBoard {
-        let forward = color.pawn_forward();
-        let (file, _) = BC::decode_tile(index);
-        let mut attacks = BitBoard(0);
-        if file > 0 {
-            attacks.0 |= 1 << (index as i16 - 1 + forward);
-        }
-
-        if file < 7 {
-            attacks.0 |= 1 << (index as i16 + 1 + forward);
-        }
-        attacks
-    }
     fn pawn_en_passant(&self, index: u8, color: Color) -> BitBoard {
         // En passant is a capture, but also a threat.
 
@@ -735,7 +698,7 @@ impl<'a> MoveGen<'a> {
         en_passant
     }
     fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.pawn_attacks(index, color)
+        self.game.board_collection.pawn_attacks(index, color)
             & (self.pawn_en_passant(index, color) | self.bc.occupied_color(!color))
     }
     fn pawn_single(&self, index: u8, color: Color) -> BitBoard {
@@ -820,27 +783,12 @@ impl<'a> MoveGen<'a> {
     }
 
     // -- Knight --
-    fn knight_attacks(&self, index: u8, color: Color) -> BitBoard {
-        let (file, rank) = BC::decode_tile(index);
-        let mut attack = BitBoard(0);
-        for (forward, right) in KNIGHT_DIRECTIONS {
-            let new_file = file as i8 + forward;
-            let new_rank = rank as i8 + right;
 
-            if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
-                continue;
-            }
-
-            attack.0 |= 1 << BC::encode_tile(new_file as u8, new_rank as u8);
-        }
-
-        attack
-    }
     fn knight_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.knight_attacks(index, color) & self.bc.occupied_color(!color)
+        self.game.board_collection.knight_attacks(index) & self.bc.occupied_color(!color)
     }
     fn knight_quiets(&self, index: u8, color: Color) -> BitBoard {
-        self.knight_attacks(index, color) & !self.bc.occupied()
+        self.game.board_collection.knight_attacks(index) & !self.bc.occupied()
     }
     fn knight_moves(&self, index: u8, color: Color) -> BitBoard {
         self.knight_quiets(index, color) | self.knight_captures(index, color)
@@ -856,31 +804,16 @@ impl<'a> MoveGen<'a> {
     }
 
     // -- King --
-    fn king_attacks(&self, index: u8, color: Color) -> BitBoard {
-        let (file, rank) = BC::decode_tile(index);
-        let mut attack = BitBoard(0);
-
-        for (f, r) in KING_DIRECTIONS {
-            let new_file = file as i8 + f;
-            let new_rank = rank as i8 + r;
-
-            if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
-                continue;
-            }
-
-            attack.0 |= 1 << BC::encode_tile(new_file as u8, new_rank as u8)
-        }
-
-        attack
-    }
     fn king_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.king_attacks(index, color)
+        self.game.board_collection.king_attacks(index)
             & self.bc.occupied_color(!color)
             & !(self.attacks_by(!color))
     }
     fn king_quiets(&self, index: u8, color: Color) -> BitBoard {
         // King cant move to an attacked square
-        self.king_attacks(index, color) & !(self.attacks_by(!color)) & !self.bc.occupied()
+        self.game.board_collection.king_attacks(index)
+            & !(self.attacks_by(!color))
+            & !self.bc.occupied()
     }
     fn king_castling_moves(&self, index: u8, color: Color, king_side: bool) -> BitBoard {
         let is_white = color == Color::White;
@@ -944,49 +877,13 @@ impl<'a> MoveGen<'a> {
         moves
     }
 
-    fn is_in_check(&self, color: Color) -> bool {
-        self.bc
-            .get_board(&ChessPiece {
-                kind: PieceKind::King,
-                color,
-            })
-            .0
-            & self.attacks_by(!color).0
-            != 0
-    }
-
     // -- Rook --
-    fn rook_attacks(&self, index: u8, color: Color) -> BitBoard {
-        let (file, rank) = BC::decode_tile(index);
-        let mut attack = BitBoard(0);
 
-        for (f, r) in ROOK_DIRECTIONS {
-            let mut new_file = file as i8;
-            let mut new_rank = rank as i8;
-
-            loop {
-                new_file += f;
-                new_rank += r;
-                if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
-                    break;
-                }
-
-                let tile = BC::encode_tile(new_file as u8, new_rank as u8);
-                attack.0 |= 1 << tile;
-
-                if self.bc.occupied().contains(tile) {
-                    break;
-                }
-            }
-        }
-
-        attack
-    }
     fn rook_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.rook_attacks(index, color) & self.bc.occupied_color(!color)
+        self.game.board_collection.rook_attacks(index) & self.bc.occupied_color(!color)
     }
     fn rook_quiets(&self, index: u8, color: Color) -> BitBoard {
-        self.rook_attacks(index, color) & !self.bc.occupied()
+        self.game.board_collection.rook_attacks(index) & !self.bc.occupied()
     }
     fn rook_moves(&self, index: u8, color: Color) -> BitBoard {
         self.rook_quiets(index, color) | self.rook_captures(index, color)
@@ -1002,37 +899,12 @@ impl<'a> MoveGen<'a> {
     }
 
     // -- Bishop --
-    fn bishop_attacks(&self, index: u8, color: Color) -> BitBoard {
-        let (file, rank) = BC::decode_tile(index);
-        let mut attack = BitBoard(0);
 
-        for (f, r) in BISHOP_DIRECTIONS {
-            let mut new_file = file as i8;
-            let mut new_rank = rank as i8;
-
-            loop {
-                new_file += f;
-                new_rank += r;
-
-                if !(0..8).contains(&new_file) || !(0..8).contains(&new_rank) {
-                    break;
-                }
-                let tile = BC::encode_tile(new_file as u8, new_rank as u8);
-                attack.0 |= 1 << tile;
-
-                if self.bc.occupied().contains(tile) {
-                    break;
-                }
-            }
-        }
-
-        attack
-    }
     fn bishop_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.bishop_attacks(index, color) & self.bc.occupied_color(!color)
+        self.game.board_collection.bishop_attacks(index) & self.bc.occupied_color(!color)
     }
     fn bishop_quiets(&self, index: u8, color: Color) -> BitBoard {
-        self.bishop_attacks(index, color) & !self.bc.occupied()
+        self.game.board_collection.bishop_attacks(index) & !self.bc.occupied()
     }
     fn bishop_moves(&self, index: u8, color: Color) -> BitBoard {
         self.bishop_quiets(index, color) | self.bishop_captures(index, color)
