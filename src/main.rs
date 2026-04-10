@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display},
     io, mem,
-    ops::{BitAnd, BitOr, Not, RangeInclusive},
+    ops::{BitAnd, BitOr, Index, Not, RangeInclusive},
     time::Instant,
 };
 
@@ -234,6 +234,29 @@ impl BitBoardCollection {
         }
     }
 
+    fn decode_notation(not: &str) -> u8 {
+        if not.len() != 2 {
+            return 0;
+        }
+        let file_c = not.chars().nth(0).unwrap();
+        let rank_c = not.chars().nth(1).unwrap();
+
+        let file = FILES.iter().position(|&c| c == file_c).unwrap() as u8;
+        let rank = rank_c.to_digit(10).unwrap() as u8 - 1;
+
+        BC::encode_tile(file, rank)
+    }
+
+    fn encode_notation(index: u8) -> String {
+        let (file, rank) = BC::decode_tile(index);
+        [
+            FILES[file as usize],
+            char::from_digit(rank as u32 + 1, 10).unwrap(),
+        ]
+        .iter()
+        .collect()
+    }
+
     fn get_board(&self, piece: &ChessPiece) -> &BitBoard {
         &self.piece_boards[piece.color as usize][piece.kind as usize]
     }
@@ -341,7 +364,7 @@ impl Display for BitBoardCollection {
 
 // -- Moves --
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Move {
     from: u8,
     to: u8,
@@ -416,12 +439,8 @@ static ROOK_DIRECTIONS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
 static BISHOP_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (-1, 1), (-1, -1), (1, -1)];
 
 struct MoveGen<'a> {
+    game: &'a Game,
     bc: &'a BitBoardCollection,
-    en_passant: Option<u8>,
-    Q: bool,
-    K: bool,
-    q: bool,
-    k: bool,
 }
 // attack = threats/protections
 // quiets = empty spaces that the piece can move to
@@ -432,12 +451,8 @@ struct MoveGen<'a> {
 impl<'a> MoveGen<'a> {
     fn new(game: &'a Game) -> Self {
         Self {
+            game,
             bc: &game.board_collection,
-            en_passant: game.en_passant_square,
-            K: game.K,
-            Q: game.Q,
-            q: game.q,
-            k: game.k,
         }
     }
 
@@ -455,6 +470,22 @@ impl<'a> MoveGen<'a> {
             while let Some(index) = bb.pop_lsb() {
                 moves.extend(self.piece_moves_list(index, piece));
             }
+        }
+
+        moves
+    }
+
+    fn legal_moves(&self, color: Color) -> Vec<Move> {
+        let mut moves = Vec::new();
+        let mut clone_game = self.game.clone();
+
+        for mv in self.pseudo_legal_moves(color) {
+            let undo = clone_game.make_move(&mv);
+            let move_gen = MoveGen::new(&clone_game);
+            if !move_gen.is_in_check(color) {
+                moves.push(mv);
+            }
+            clone_game.undo_move(&undo);
         }
 
         moves
@@ -581,7 +612,8 @@ impl<'a> MoveGen<'a> {
         // En passant is a capture, but also a threat.
 
         let en_passant = self
-            .en_passant
+            .game
+            .en_passant_square
             .map(|ep| BitBoard(1 << ep))
             .unwrap_or(BitBoard(0));
 
@@ -648,7 +680,7 @@ impl<'a> MoveGen<'a> {
         let mut captures = self.pawn_captures(index, color);
 
         while let Some(to) = captures.pop_lsb() {
-            let is_en_passant = self.en_passant == Some(to);
+            let is_en_passant = self.game.en_passant_square == Some(to);
             let ep = if is_en_passant {
                 MoveFlags::EN_PASSANT
             } else {
@@ -739,7 +771,12 @@ impl<'a> MoveGen<'a> {
         let is_white = color == Color::White;
         let comb_index = is_white as usize * 2 + king_side as usize;
 
-        let rights = [self.q, self.k, self.Q, self.K][comb_index];
+        let rights = [
+            self.game.q_black,
+            self.game.k_black,
+            self.game.q_white,
+            self.game.k_white,
+        ][comb_index];
         let empty = [BLACK_Q_EMPTY, BLACK_K_EMPTY, WHITE_Q_EMPTY, WHITE_K_EMPTY][comb_index];
         let safe = [BLACK_Q_SAFE, BLACK_K_SAFE, WHITE_Q_SAFE, WHITE_K_SAFE][comb_index];
 
@@ -786,7 +823,7 @@ impl<'a> MoveGen<'a> {
         let mut castles_q = self.king_castling_moves(index, color, false);
 
         while let Some(to) = castles_q.pop_lsb() {
-            moves.push(base_move.modified(to, MoveFlags::CASTLE_KING));
+            moves.push(base_move.modified(to, MoveFlags::CASTLE_QUEEN));
         }
 
         moves
@@ -899,13 +936,11 @@ impl<'a> MoveGen<'a> {
 }
 
 struct UndoMove {
-    from: u8,
-    to: u8,
-    flags: MoveFlags,
+    mv: Move,
     piece_captured: Option<ChessPiece>,
-    white_turn: bool,
-    en_passant_square: Option<ChessPiece>,
-    castling_rights_lost: Option<u8>,
+    rights: u8, // bitmask
+    prev_fifty_move_counter: u32,
+    en_passant_square: Option<u8>,
 }
 
 impl UndoMove {
@@ -927,17 +962,31 @@ impl UndoMove {
             false => None,
         };
 
+        let mut rights = 0u8;
+        if game.k_white {
+            rights |= 1;
+        }
+        if game.q_white {
+            rights |= 2;
+        }
+        if game.k_black {
+            rights |= 4;
+        }
+        if game.q_black {
+            rights |= 8;
+        }
+
         Self {
-            from: m.from,
-            to: m.to,
-            flags: m.flags,
+            mv: *m,
             piece_captured,
-            white_turn: true,
-            en_passant_square: None,
-            castling_rights_lost: None,
+            rights,
+            prev_fifty_move_counter: game.fifty_move_rule,
+            en_passant_square: game.en_passant_square,
         }
     }
 }
+
+const FILES: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 
 // Basically just FEN
 #[derive(Clone, Copy)]
@@ -945,38 +994,29 @@ struct Game {
     board_collection: BitBoardCollection,
     white_turn: bool,
     en_passant_square: Option<u8>,
-    Q: bool,
-    K: bool,
-    q: bool,
-    k: bool,
-    fifty_move_rule: u16,
-    game_move: u16,
+    q_white: bool,
+    k_white: bool,
+    q_black: bool,
+    k_black: bool,
+    fifty_move_rule: u32,
+    move_count: u16,
 }
 
 impl Game {
-    fn new() -> Self {
-        Self {
-            board_collection: BitBoardCollection::new(),
-            white_turn: true,
-            en_passant_square: None,
-            K: true,
-            Q: true,
-            q: true,
-            k: true,
-            fifty_move_rule: 0,
-            game_move: 0,
-        }
-    }
-
     fn from_fen(fen: &str) -> Self {
         let fen_string = String::from(fen);
 
         let parts = fen_string.split_whitespace().collect::<Vec<&str>>();
         let white_turn = parts[1].chars().nth(0).unwrap() == 'w';
 
-        let [K, Q, k, q] = ['K', 'Q', 'k', 'q'].map(|c| parts[2].contains(c));
-        let en_passant_square = parts[3].parse::<u8>().ok();
-        let fifty_move_rule = parts[4].parse::<u16>().unwrap_or(0);
+        let [k_white, q_white, k_black, q_black] =
+            ['K', 'Q', 'k', 'q'].map(|c| parts[2].contains(c));
+        let en_passant_square = if parts[3] == "-" {
+            None
+        } else {
+            Some(BC::decode_notation(parts[3]))
+        };
+        let fifty_move_rule = parts[4].parse::<u32>().unwrap_or(0);
         let game_move = parts[5].parse::<u16>().unwrap_or(0);
 
         Self {
@@ -987,23 +1027,92 @@ impl Game {
             ),
             white_turn,
             en_passant_square,
-            K,
-            Q,
-            k,
-            q,
+            k_white,
+            q_white,
+            k_black,
+            q_black,
             fifty_move_rule,
-            game_move,
+            move_count: game_move,
         }
     }
 
+    fn into_fen(&self) -> String {
+        let mut board = String::new();
+
+        for rank in (0..8).rev() {
+            let mut empty_spaces = 0;
+            for file in 0..8 {
+                // println!("{}", empty_spaces);
+                if let Some(piece) = self
+                    .board_collection
+                    .piece_at_index(BC::encode_tile(file, rank))
+                {
+                    if empty_spaces > 0 {
+                        board.push(char::from_digit(empty_spaces, 10).unwrap());
+                        empty_spaces = 0;
+                    }
+
+                    board.push(piece.encode_fen());
+                } else {
+                    empty_spaces += 1;
+                }
+            }
+            if empty_spaces > 0 {
+                board.push(char::from_digit(empty_spaces, 10).unwrap());
+            }
+
+            board.push('/');
+        }
+
+        board = board.trim_matches('/').to_string();
+        let turn = if self.white_turn { "w" } else { "b" };
+        let castling_rights =
+            if (self.k_black || self.k_white || self.q_black || self.q_white) == false {
+                String::from("-")
+            } else {
+                let rights = ['K', 'Q', 'k', 'q'];
+                [self.k_white, self.q_white, self.k_black, self.q_black]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| if *r { Some(rights[i]) } else { None })
+                    .filter(|e| e.is_some())
+                    .flatten()
+                    .collect::<String>()
+            };
+
+        let ep = if let Some(square) = self.en_passant_square {
+            BC::encode_notation(square)
+        } else {
+            String::from("-")
+        };
+
+        let half_move = self.fifty_move_rule.to_string();
+        let move_count = self.move_count.to_string();
+
+        [
+            board,
+            turn.to_string(),
+            castling_rights,
+            ep,
+            half_move,
+            move_count,
+        ]
+        .join(" ")
+    }
+
     fn make_move(&mut self, m: &Move) -> UndoMove {
+        let mut undo_move = UndoMove::new(m, self);
+
         let piece_from = self.board_collection.piece_at_index(m.from).unwrap();
+
         let color = if self.white_turn {
             Color::White
         } else {
             Color::Black
         };
+
         self.en_passant_square = None;
+
         let is_promotion = m.flags.intersects(
             MoveFlags::PROMOTE_Q
                 | MoveFlags::PROMOTE_R
@@ -1013,8 +1122,9 @@ impl Game {
 
         if m.flags.contains(MoveFlags::CAPTURE) {
             // En passant is a capture where the "capture space" is empty!
-            if let Some(piece_to) = self.board_collection.piece_at_index(m.to) {
-                self.board_collection.remove(m.to, &piece_to);
+            if let Some(piece_captured) = self.board_collection.piece_at_index(m.to) {
+                undo_move.piece_captured = Some(piece_captured);
+                self.board_collection.remove(m.to, &piece_captured);
             }
         }
 
@@ -1047,13 +1157,13 @@ impl Game {
 
         if m.flags.contains(MoveFlags::EN_PASSANT) {
             let target = m.to as i16 - color.pawn_forward();
-            self.board_collection.remove(
-                target as u8,
-                &ChessPiece {
-                    kind: PieceKind::Pawn,
-                    color: !color,
-                },
-            );
+            let captured_pawn = ChessPiece {
+                kind: PieceKind::Pawn,
+                color: !color,
+            };
+
+            undo_move.piece_captured = Some(captured_pawn);
+            self.board_collection.remove(target as u8, &captured_pawn);
         }
 
         if m.flags.contains(MoveFlags::DOUBLE_PAWN_PUSH) {
@@ -1082,32 +1192,106 @@ impl Game {
 
         if piece_from.kind == PieceKind::King {
             if self.white_turn {
-                self.K = false;
-                self.Q = false;
+                self.k_white = false;
+                self.q_white = false;
             } else {
-                self.k = false;
-                self.q = false;
+                self.k_black = false;
+                self.q_black = false;
             }
         }
 
         if m.from == 0 || m.to == 0 {
-            self.Q = false;
+            self.q_white = false;
         }
 
         if m.from == 7 || m.to == 7 {
-            self.K = false;
+            self.k_white = false;
         }
 
         if m.from == 56 || m.to == 56 {
-            self.q = false;
+            self.q_black = false;
         }
 
         if m.from == 63 || m.to == 63 {
-            self.k = false;
+            self.k_black = false;
         }
 
         self.white_turn = !self.white_turn;
-        UndoMove::new(m, self)
+
+        undo_move
+    }
+
+    fn undo_move(&mut self, u: &UndoMove) {
+        self.white_turn = !self.white_turn;
+        let color = if self.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        self.fifty_move_rule = u.prev_fifty_move_counter;
+        self.en_passant_square = u.en_passant_square;
+
+        let piece_from = self.board_collection.piece_at_index(u.mv.to).unwrap();
+        self.board_collection.remove(u.mv.to, &piece_from);
+        self.board_collection.insert(u.mv.from, &piece_from);
+
+        if !u.mv.flags.contains(MoveFlags::EN_PASSANT) && u.mv.flags.contains(MoveFlags::CAPTURE) {
+            self.board_collection
+                .insert(u.mv.to, &u.piece_captured.unwrap());
+        } else if u.mv.flags.contains(MoveFlags::CAPTURE) {
+            self.board_collection.insert(
+                (u.mv.to as i16 - color.pawn_forward()) as u8,
+                &ChessPiece {
+                    kind: PieceKind::Pawn,
+                    color: !color,
+                },
+            );
+        }
+
+        if u.mv.flags.intersects(
+            MoveFlags::PROMOTE_Q
+                | MoveFlags::PROMOTE_R
+                | MoveFlags::PROMOTE_N
+                | MoveFlags::PROMOTE_B,
+        ) {
+            self.board_collection.remove(u.mv.from, &piece_from);
+            self.board_collection.insert(
+                u.mv.from,
+                &ChessPiece {
+                    kind: PieceKind::Pawn,
+                    color,
+                },
+            );
+        }
+
+        let prev = u.rights;
+        self.k_white = prev & 1 != 0;
+        self.q_white = prev & 2 != 0;
+        self.k_black = prev & 4 != 0;
+        self.q_black = prev & 8 != 0;
+
+        // King already moved, just need to move rook
+        if u.mv.flags.contains(MoveFlags::CASTLE_KING) {
+            // King side, so rook is left of king
+            let rook = ChessPiece {
+                kind: PieceKind::Rook,
+                color,
+            };
+
+            self.board_collection.remove(u.mv.to - 1, &rook);
+            self.board_collection.insert(u.mv.to + 1, &rook);
+        }
+
+        if u.mv.flags.contains(MoveFlags::CASTLE_QUEEN) {
+            // King side, so rook is left of king
+            let rook = ChessPiece {
+                kind: PieceKind::Rook,
+                color,
+            };
+
+            self.board_collection.remove(u.mv.to + 1, &rook);
+            self.board_collection.insert(u.mv.to - 2, &rook);
+        }
     }
 }
 
@@ -1120,116 +1304,60 @@ fn take_input() -> String {
 
     io::stdin().read_line(&mut input).unwrap_or_default();
 
-    input.trim().to_lowercase().to_string()
+    input.trim().to_string()
 }
 
+const START_POS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 fn main() {
-    // let game = Game::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-    let game = Game::from_fen("r2qr1k1/ppp2ppp/2n1bn2/4p3/3Pp3/2N1BN2/PPPQBPPP/R3R1K1 w - - 0 2");
+    let mut game = Game::from_fen(START_POS);
 
-    println!("{}\n{}", game.board_collection, game.white_turn);
-    for n in 0..7 {
-        let start = Instant::now();
-        let c = count_positions_n_deep(n + 1, &game);
-        println!("{}: {} (took {}s)", n + 1, c, start.elapsed().as_secs_f32());
+    loop {
+        let move_gen = MoveGen::new(&game);
+
+        let input = take_input();
+
+        if input.starts_with("position") {
+            let parts = input.split_ascii_whitespace().collect::<Vec<&str>>();
+
+            if parts[1] == "startpos" {
+                game = Game::from_fen(START_POS);
+            } else if parts[1] == "fen" {
+                // position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+                // the fen is parts 2..=7
+
+                let mut new_game = Game::from_fen(parts[2..=7].join(" ").as_str());
+                let move_gen = MoveGen::new(&new_game);
+
+                if parts.len() < 9 || parts[8] != "moves" {
+                    game = new_game;
+                    continue;
+                }
+
+                for mv in parts[9..parts.len()].iter() {
+                    if mv.len() != 4 {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if input.starts_with("go perft") {
+            let n = input.split_whitespace().collect::<Vec<&str>>()[2]
+                .parse::<u8>()
+                .unwrap_or(0);
+
+            println!("\ntotal: {}", count_positions_n_deep(n, &mut game, true))
+        }
+
+        if input == "d" {
+            println!("{}", game.board_collection);
+            println!("Fen: {}", game.into_fen());
+        }
     }
-
-    // loop {
-    //     clear();
-    //     // for c in 0..2 {
-    //     //     for k in 0..6 {
-    //     //         let piece = ChessPiece {
-    //     //             color: c.try_into().unwrap(),
-    //     //             kind: k.try_into().unwrap(),
-    //     //         };
-
-    //     //         println!(
-    //     //             "{}\n{}",
-    //     //             piece.encode_fen(),
-    //     //             game.board_collection.get_board(&piece)
-    //     //         );
-    //     //     }
-    //     // }
-
-    //     println!("{}", game.white_turn);
-    //     println!("{}", game.board_collection);
-    //     let move_gen = MoveGen::new(&game);
-    //     // println!(
-    //     //     "{}",
-    //     //     move_gen.all_attacked_by(Color::White) & move_gen.bc.occupied_color(Color::Black)
-    //     // );
-
-    //     let input = take_input();
-
-    //     if input.starts_with("d") {
-    //         let parts = input.split_whitespace().collect::<Vec<&str>>();
-
-    //         if parts.len() != 2 {
-    //             continue;
-    //         }
-
-    //         let space = parts[1];
-
-    //         if space.len() != 2 {
-    //             continue;
-    //         }
-
-    //         let files = vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
-    //         let file = files
-    //             .iter()
-    //             .position(|&c| c == space.chars().nth(0).unwrap())
-    //             .unwrap() as u8;
-    //         let rank = space.chars().nth(1).unwrap().to_digit(10).unwrap_or(0) as u8 - 1;
-    //         let index = BC::encode_tile(file, rank);
-    //         let maybe_piece = game.board_collection.piece_at_index(index);
-
-    //         if let Some(piece) = maybe_piece {
-    //             clear();
-    //             println!(
-    //                 "{}\npress enter to continue",
-    //                 move_gen.piece_moves(index, piece)
-    //             );
-    //             take_input();
-    //         }
-    //     }
-
-    //     if input.starts_with("mv") {
-    //         let parts = input.split_whitespace().collect::<Vec<&str>>();
-
-    //         if parts.len() != 3 {
-    //             continue;
-    //         }
-
-    //         let from = parts[1];
-    //         let to = parts[2];
-
-    //         if from.len() != to.len() || from.len() != 2 {
-    //             continue;
-    //         }
-
-    //         let files = vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
-    //         let from_file = files
-    //             .iter()
-    //             .position(|&c| c == from.chars().nth(0).unwrap())
-    //             .unwrap() as u8;
-    //         let from_rank = from.chars().nth(1).unwrap().to_digit(10).unwrap_or(0) as u8 - 1;
-
-    //         let to_file = files
-    //             .iter()
-    //             .position(|&c| c == to.chars().nth(0).unwrap())
-    //             .unwrap() as u8;
-    //         let to_rank = to.chars().nth(1).unwrap().to_digit(10).unwrap_or(0) as u8 - 1;
-
-    //         let from_tile = BC::encode_tile(from_file, from_rank);
-    //         let to_tile = BC::encode_tile(to_file, to_rank);
-
-    //         println!("{} {}", from_tile, to_tile);
-    //     }
-    // }
 }
 
 // Perft function
-fn count_positions_n_deep(n: u8, game: &Game) -> u32 {
+fn count_positions_n_deep(n: u8, game: &mut Game, split: bool) -> u32 {
     if n == 0 {
         return 1;
     }
@@ -1241,14 +1369,33 @@ fn count_positions_n_deep(n: u8, game: &Game) -> u32 {
     } else {
         Color::Black
     };
-    let moves = move_gen.pseudo_legal_moves(color);
+
+    let mut moves = move_gen.legal_moves(color);
+
+    if split {
+        moves.sort_by(|a, b| {
+            let mut a_s = BC::encode_notation(a.from);
+            a_s.extend(BC::encode_notation(a.to).chars());
+
+            let mut b_s = BC::encode_notation(b.from);
+            b_s.extend(BC::encode_notation(b.to).chars());
+
+            a_s.cmp(&b_s)
+        });
+    }
+
     for mv in moves.iter() {
-        let mut new_game = game.clone();
-        new_game.make_move(mv);
-        let new_gen = MoveGen::new(&new_game);
-        if !new_gen.is_in_check(color) {
-            s += count_positions_n_deep(n - 1, &new_game);
+        let undo = game.make_move(mv);
+        let m = count_positions_n_deep(n - 1, game, false);
+        game.undo_move(&undo);
+        s += m;
+
+        if split {
+            let mut mv_s = BC::encode_notation(mv.from);
+            mv_s.extend(BC::encode_notation(mv.to).chars());
+            println!("{}: {}", mv_s, m);
         }
     }
+
     s
 }
