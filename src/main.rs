@@ -564,8 +564,11 @@ impl<'a> MoveGen<'a> {
             occupied: BitBoard(0),
         };
 
-        mg.black_attacks = mg.compute_attacks(Color::Black);
-        mg.white_attacks = mg.compute_attacks(Color::White);
+        if game.white_turn {
+            mg.black_attacks = mg.compute_attacks(Color::Black);
+        } else {
+            mg.white_attacks = mg.compute_attacks(Color::White);
+        }
 
         mg.white_occ = game.board_collection.occupied_color(Color::White);
         mg.black_occ = game.board_collection.occupied_color(Color::Black);
