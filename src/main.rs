@@ -225,6 +225,123 @@ impl BitBoardCollection {
         }
     }
 
+    fn is_in_check(&self, color: Color) -> bool {
+        let king_bb = self
+            .get_board(&ChessPiece {
+                kind: PieceKind::King,
+                color,
+            })
+            .0;
+
+        let opponent = !color;
+        let mut attacks = BitBoard(0);
+
+        for kind in 0..6 {
+            let piece = ChessPiece {
+                kind: kind.try_into().unwrap(),
+                color: opponent,
+            };
+            let mut bb = *self.get_board(&piece);
+            while let Some(index) = bb.pop_lsb() {
+                attacks.0 |= self.piece_attacks(index, piece).0;
+            }
+        }
+
+        king_bb & attacks.0 != 0
+    }
+
+    fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
+        match piece.kind {
+            PieceKind::Pawn => self.pawn_attacks(index, piece.color),
+            PieceKind::Knight => self.knight_attacks(index),
+            PieceKind::Bishop => self.bishop_attacks(index),
+            PieceKind::Rook => self.rook_attacks(index),
+            PieceKind::Queen => BitBoard(self.bishop_attacks(index).0 | self.rook_attacks(index).0),
+            PieceKind::King => self.king_attacks(index),
+        }
+    }
+
+    fn pawn_attacks(&self, index: u8, color: Color) -> BitBoard {
+        let forward = color.pawn_forward();
+        let (file, _) = BC::decode_tile(index);
+        let mut attacks = BitBoard(0);
+        if file > 0 {
+            attacks.0 |= 1 << (index as i16 - 1 + forward);
+        }
+        if file < 7 {
+            attacks.0 |= 1 << (index as i16 + 1 + forward);
+        }
+        attacks
+    }
+
+    fn knight_attacks(&self, index: u8) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+        for (f, r) in KNIGHT_DIRECTIONS {
+            let nf = file as i8 + f;
+            let nr = rank as i8 + r;
+            if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                attack.0 |= 1 << BC::encode_tile(nf as u8, nr as u8);
+            }
+        }
+        attack
+    }
+
+    fn king_attacks(&self, index: u8) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+        for (f, r) in KING_DIRECTIONS {
+            let nf = file as i8 + f;
+            let nr = rank as i8 + r;
+            if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                attack.0 |= 1 << BC::encode_tile(nf as u8, nr as u8);
+            }
+        }
+        attack
+    }
+
+    fn rook_attacks(&self, index: u8) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+        for (f, r) in ROOK_DIRECTIONS {
+            let (mut nf, mut nr) = (file as i8, rank as i8);
+            loop {
+                nf += f;
+                nr += r;
+                if !(0..8).contains(&nf) || !(0..8).contains(&nr) {
+                    break;
+                }
+                let tile = BC::encode_tile(nf as u8, nr as u8);
+                attack.0 |= 1 << tile;
+                if self.occupied().contains(tile) {
+                    break;
+                }
+            }
+        }
+        attack
+    }
+
+    fn bishop_attacks(&self, index: u8) -> BitBoard {
+        let (file, rank) = BC::decode_tile(index);
+        let mut attack = BitBoard(0);
+        for (f, r) in BISHOP_DIRECTIONS {
+            let (mut nf, mut nr) = (file as i8, rank as i8);
+            loop {
+                nf += f;
+                nr += r;
+                if !(0..8).contains(&nf) || !(0..8).contains(&nr) {
+                    break;
+                }
+                let tile = BC::encode_tile(nf as u8, nr as u8);
+                attack.0 |= 1 << tile;
+                if self.occupied().contains(tile) {
+                    break;
+                }
+            }
+        }
+        attack
+    }
+
     fn decode_notation(not: &str) -> u8 {
         if not.len() != 2 {
             return 0;
@@ -442,7 +559,6 @@ impl<'a> MoveGen<'a> {
         };
 
         mg.black_attacks = mg.compute_attacks(Color::Black);
-
         mg.white_attacks = mg.compute_attacks(Color::White);
 
         mg
@@ -1366,23 +1482,30 @@ fn count_positions_n_deep(n: u8, game: &mut Game, split: bool) -> u32 {
     }
 
     let mut s = 0;
-    let move_gen = MoveGen::new(game);
     let color = if game.white_turn {
         Color::White
     } else {
         Color::Black
     };
+    let move_gen = MoveGen::new(game);
+    let pseudo_moves = move_gen.pseudo_legal_moves(color);
 
-    let mut moves = move_gen.legal_moves(color);
+    let mut moves: Vec<Move> = pseudo_moves
+        .into_iter()
+        .filter(|mv| {
+            let undo = game.make_move(mv);
+            let legal = !game.board_collection.is_in_check(color);
+            game.undo_move(&undo);
+            legal
+        })
+        .collect();
 
     if split {
         moves.sort_by(|a, b| {
             let mut a_s = BC::encode_notation(a.from);
             a_s.extend(BC::encode_notation(a.to).chars());
-
             let mut b_s = BC::encode_notation(b.from);
             b_s.extend(BC::encode_notation(b.to).chars());
-
             a_s.cmp(&b_s)
         });
     }
