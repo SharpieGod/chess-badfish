@@ -542,6 +542,9 @@ struct MoveGen<'a> {
     bc: &'a BitBoardCollection,
     white_attacks: BitBoard,
     black_attacks: BitBoard,
+    occupied: BitBoard,
+    white_occ: BitBoard,
+    black_occ: BitBoard,
 }
 // attack = threats/protections
 // quiets = empty spaces that the piece can move to
@@ -556,12 +559,26 @@ impl<'a> MoveGen<'a> {
             bc: &game.board_collection,
             white_attacks: BitBoard(0),
             black_attacks: BitBoard(0),
+            white_occ: BitBoard(0),
+            black_occ: BitBoard(0),
+            occupied: BitBoard(0),
         };
 
         mg.black_attacks = mg.compute_attacks(Color::Black);
         mg.white_attacks = mg.compute_attacks(Color::White);
 
+        mg.white_occ = game.board_collection.occupied_color(Color::White);
+        mg.black_occ = game.board_collection.occupied_color(Color::Black);
+        mg.occupied = mg.white_occ | mg.black_occ;
+
         mg
+    }
+
+    fn occupied_color(&self, color: Color) -> BitBoard {
+        match color {
+            Color::White => self.white_occ,
+            Color::Black => self.black_occ,
+        }
     }
 
     fn compute_attacks(&self, color: Color) -> BitBoard {
@@ -699,11 +716,11 @@ impl<'a> MoveGen<'a> {
     }
     fn pawn_captures(&self, index: u8, color: Color) -> BitBoard {
         self.game.board_collection.pawn_attacks(index, color)
-            & (self.pawn_en_passant(index, color) | self.bc.occupied_color(!color))
+            & (self.pawn_en_passant(index, color) | self.occupied_color(!color))
     }
     fn pawn_single(&self, index: u8, color: Color) -> BitBoard {
         let forward = color.pawn_forward();
-        let single = BitBoard(0b1 << (index as i16 + forward)) & !self.bc.occupied();
+        let single = BitBoard(0b1 << (index as i16 + forward)) & !self.occupied;
 
         single
     }
@@ -714,7 +731,7 @@ impl<'a> MoveGen<'a> {
         let single = self.pawn_single(index, color);
 
         let double = if start_rank_range.contains(&index) && !single.is_empty() {
-            BitBoard(0b1 << (index as i16 + forward * 2)) & !self.bc.occupied()
+            BitBoard(0b1 << (index as i16 + forward * 2)) & !self.occupied
         } else {
             BitBoard(0)
         };
@@ -785,10 +802,10 @@ impl<'a> MoveGen<'a> {
     // -- Knight --
 
     fn knight_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.game.board_collection.knight_attacks(index) & self.bc.occupied_color(!color)
+        self.game.board_collection.knight_attacks(index) & self.occupied_color(!color)
     }
     fn knight_quiets(&self, index: u8, color: Color) -> BitBoard {
-        self.game.board_collection.knight_attacks(index) & !self.bc.occupied()
+        self.game.board_collection.knight_attacks(index) & !self.occupied
     }
     fn knight_moves(&self, index: u8, color: Color) -> BitBoard {
         self.knight_quiets(index, color) | self.knight_captures(index, color)
@@ -806,14 +823,12 @@ impl<'a> MoveGen<'a> {
     // -- King --
     fn king_captures(&self, index: u8, color: Color) -> BitBoard {
         self.game.board_collection.king_attacks(index)
-            & self.bc.occupied_color(!color)
+            & self.occupied_color(!color)
             & !(self.attacks_by(!color))
     }
     fn king_quiets(&self, index: u8, color: Color) -> BitBoard {
         // King cant move to an attacked square
-        self.game.board_collection.king_attacks(index)
-            & !(self.attacks_by(!color))
-            & !self.bc.occupied()
+        self.game.board_collection.king_attacks(index) & !(self.attacks_by(!color)) & !self.occupied
     }
     fn king_castling_moves(&self, index: u8, color: Color, king_side: bool) -> BitBoard {
         let is_white = color == Color::White;
@@ -829,7 +844,7 @@ impl<'a> MoveGen<'a> {
         let safe = [BLACK_Q_SAFE, BLACK_K_SAFE, WHITE_Q_SAFE, WHITE_K_SAFE][comb_index];
 
         let attacks = self.attacks_by(!color);
-        let occupied = self.bc.occupied();
+        let occupied = self.occupied;
         let target = if king_side { index + 2 } else { index - 2 };
 
         if rights && (safe & attacks.0) == 0 && (empty & occupied.0) == 0 {
@@ -880,10 +895,10 @@ impl<'a> MoveGen<'a> {
     // -- Rook --
 
     fn rook_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.game.board_collection.rook_attacks(index) & self.bc.occupied_color(!color)
+        self.game.board_collection.rook_attacks(index) & self.occupied_color(!color)
     }
     fn rook_quiets(&self, index: u8, color: Color) -> BitBoard {
-        self.game.board_collection.rook_attacks(index) & !self.bc.occupied()
+        self.game.board_collection.rook_attacks(index) & !self.occupied
     }
     fn rook_moves(&self, index: u8, color: Color) -> BitBoard {
         self.rook_quiets(index, color) | self.rook_captures(index, color)
@@ -901,10 +916,10 @@ impl<'a> MoveGen<'a> {
     // -- Bishop --
 
     fn bishop_captures(&self, index: u8, color: Color) -> BitBoard {
-        self.game.board_collection.bishop_attacks(index) & self.bc.occupied_color(!color)
+        self.game.board_collection.bishop_attacks(index) & self.occupied_color(!color)
     }
     fn bishop_quiets(&self, index: u8, color: Color) -> BitBoard {
-        self.game.board_collection.bishop_attacks(index) & !self.bc.occupied()
+        self.game.board_collection.bishop_attacks(index) & !self.occupied
     }
     fn bishop_moves(&self, index: u8, color: Color) -> BitBoard {
         self.bishop_quiets(index, color) | self.bishop_captures(index, color)
