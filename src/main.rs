@@ -138,16 +138,6 @@ impl ChessPiece {
 struct BitBoard(u64);
 
 impl BitBoard {
-    fn break_down(&self) -> HashSet<u8> {
-        let mut set = HashSet::new();
-        for i in 0..64 {
-            if self.0 & (1 << i) != 0 {
-                set.insert(i);
-            }
-        }
-
-        set
-    }
     fn insert(&mut self, index: u8) {
         self.0 |= 1 << index;
     }
@@ -222,7 +212,7 @@ impl Display for BitBoard {
 struct BitBoardCollection {
     // 6 pieces, 2 colours
     piece_boards: [[BitBoard; 6]; 2],
-    // TODO: pin bitboard, and yeah
+    mailbox: [Option<ChessPiece>; 64],
 }
 
 use BitBoardCollection as BC;
@@ -231,6 +221,7 @@ impl BitBoardCollection {
     fn new() -> Self {
         Self {
             piece_boards: [[BitBoard(0); 6]; 2],
+            mailbox: [None; 64],
         }
     }
 
@@ -265,10 +256,12 @@ impl BitBoardCollection {
     }
 
     fn insert(&mut self, index: u8, piece: &ChessPiece) {
+        self.mailbox[index as usize] = Some(*piece);
         self.get_board_mut(piece).insert(index);
     }
 
     fn remove(&mut self, index: u8, piece: &ChessPiece) {
+        self.mailbox[index as usize] = None;
         self.get_board_mut(piece).remove(index);
     }
 
@@ -288,18 +281,7 @@ impl BitBoardCollection {
     }
 
     fn piece_at_index(&self, index: u8) -> Option<ChessPiece> {
-        for c in 0..2 {
-            for k in 0..6 {
-                if self.piece_boards[c][k].contains(index) {
-                    return Some(ChessPiece {
-                        kind: k.try_into().unwrap(),
-                        color: c.try_into().unwrap(),
-                    });
-                }
-            }
-        }
-
-        return None;
+        return self.mailbox[index as usize];
     }
 
     fn from_fen(fen: &str) -> Self {
@@ -441,6 +423,8 @@ static BISHOP_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (-1, 1), (-1, -1), (1, -1)];
 struct MoveGen<'a> {
     game: &'a Game,
     bc: &'a BitBoardCollection,
+    white_attacks: BitBoard,
+    black_attacks: BitBoard,
 }
 // attack = threats/protections
 // quiets = empty spaces that the piece can move to
@@ -450,9 +434,42 @@ struct MoveGen<'a> {
 // lists need to be split up in quiets and captures, pawns have special double push for en_passant tracking
 impl<'a> MoveGen<'a> {
     fn new(game: &'a Game) -> Self {
-        Self {
+        let mut mg = Self {
             game,
             bc: &game.board_collection,
+            white_attacks: BitBoard(0),
+            black_attacks: BitBoard(0),
+        };
+
+        mg.black_attacks = mg.compute_attacks(Color::Black);
+
+        mg.white_attacks = mg.compute_attacks(Color::White);
+
+        mg
+    }
+
+    fn compute_attacks(&self, color: Color) -> BitBoard {
+        let mut attacks = BitBoard(0);
+
+        for kind in 0..6 {
+            let piece = ChessPiece {
+                kind: kind.try_into().unwrap(),
+                color,
+            };
+            let mut bb = *self.bc.get_board(&piece);
+
+            while let Some(index) = bb.pop_lsb() {
+                attacks.0 |= self.piece_attacks(index, piece).0;
+            }
+        }
+
+        attacks
+    }
+
+    fn attacks_by(&self, color: Color) -> BitBoard {
+        match color {
+            Color::White => self.white_attacks,
+            Color::Black => self.black_attacks,
         }
     }
 
@@ -555,24 +572,6 @@ impl<'a> MoveGen<'a> {
             }
             PieceKind::King => self.king_moves_list(index, color),
         }
-    }
-
-    fn all_attacked_by(&self, color: Color) -> BitBoard {
-        let mut attacks = BitBoard(0);
-
-        for kind in 0..6 {
-            let piece = ChessPiece {
-                kind: kind.try_into().unwrap(),
-                color,
-            };
-            let mut bb = *self.bc.get_board(&piece);
-
-            while let Some(index) = bb.pop_lsb() {
-                attacks.0 |= self.piece_attacks(index, piece).0;
-            }
-        }
-
-        attacks
     }
 
     fn basic_moves_list(&self, index: u8, piece: ChessPiece) -> Vec<Move> {
@@ -761,11 +760,11 @@ impl<'a> MoveGen<'a> {
     fn king_captures(&self, index: u8, color: Color) -> BitBoard {
         self.king_attacks(index, color)
             & self.bc.occupied_color(!color)
-            & !(self.all_attacked_by(!color))
+            & !(self.attacks_by(!color))
     }
     fn king_quiets(&self, index: u8, color: Color) -> BitBoard {
         // King cant move to an attacked square
-        self.king_attacks(index, color) & !(self.all_attacked_by(!color)) & !self.bc.occupied()
+        self.king_attacks(index, color) & !(self.attacks_by(!color)) & !self.bc.occupied()
     }
     fn king_castling_moves(&self, index: u8, color: Color, king_side: bool) -> BitBoard {
         let is_white = color == Color::White;
@@ -780,7 +779,7 @@ impl<'a> MoveGen<'a> {
         let empty = [BLACK_Q_EMPTY, BLACK_K_EMPTY, WHITE_Q_EMPTY, WHITE_K_EMPTY][comb_index];
         let safe = [BLACK_Q_SAFE, BLACK_K_SAFE, WHITE_Q_SAFE, WHITE_K_SAFE][comb_index];
 
-        let attacks = self.all_attacked_by(!color);
+        let attacks = self.attacks_by(!color);
         let occupied = self.bc.occupied();
         let target = if king_side { index + 2 } else { index - 2 };
 
@@ -836,7 +835,7 @@ impl<'a> MoveGen<'a> {
                 color,
             })
             .0
-            & self.all_attacked_by(!color).0
+            & self.attacks_by(!color).0
             != 0
     }
 
@@ -1342,11 +1341,15 @@ fn main() {
         }
 
         if input.starts_with("go perft") {
+            let track = Instant::now();
             let n = input.split_whitespace().collect::<Vec<&str>>()[2]
                 .parse::<u8>()
                 .unwrap_or(0);
-
-            println!("\ntotal: {}", count_positions_n_deep(n, &mut game, true))
+            println!(
+                "\ntotal: {} ({}s)",
+                count_positions_n_deep(n, &mut game, true),
+                track.elapsed().as_secs_f32()
+            )
         }
 
         if input == "d" {
