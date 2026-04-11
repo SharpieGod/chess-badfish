@@ -766,6 +766,39 @@ impl<'a> MoveGen<'a> {
         mg
     }
 
+    fn filter_legal(pseudo_moves: Vec<Move>, game: &mut Game, color: Color) -> Vec<Move> {
+        let check_info = game.board_collection.check_info(color);
+        let pin_info = game.board_collection.pin_info(color);
+
+        pseudo_moves
+            .into_iter()
+            .filter(|mv| {
+                let is_king = game
+                    .board_collection
+                    .piece_at_index(mv.from)
+                    .map(|p| p.kind == PieceKind::King)
+                    .unwrap_or(false);
+                let is_pinned = pin_info.pins.contains(mv.from);
+                let is_en_passant = mv.flags.contains(MoveFlags::EN_PASSANT);
+
+                if is_king || is_en_passant {
+                    let undo = game.make_move(mv);
+                    let legal = !game.board_collection.is_in_check(color);
+                    game.undo_move(&undo);
+                    legal
+                } else if is_pinned {
+                    if check_info.in_check {
+                        false
+                    } else {
+                        pin_info.pin_rays[mv.from as usize].contains(mv.to)
+                    }
+                } else {
+                    !check_info.in_check || check_info.check_mask.contains(mv.to)
+                }
+            })
+            .collect()
+    }
+
     fn occupied_color(&self, color: Color) -> BitBoard {
         match color {
             Color::White => self.white_occ,
@@ -1617,42 +1650,18 @@ fn count_positions_n_deep(n: u8, game: &mut Game, split: bool) -> u32 {
     } else {
         Color::Black
     };
+
     let move_gen = MoveGen::new(game);
-    let check_info = game.board_collection.check_info(color);
-    let pin_info = game.board_collection.pin_info(color);
 
-    let pseudo_moves = move_gen.pseudo_legal_moves(color);
+    let moves = {
+        let move_gen = MoveGen::new(game);
+        let pseudo = move_gen.pseudo_legal_moves(color);
+        pseudo
+    };
 
-    for mv in pseudo_moves.iter() {
-        let is_king = game
-            .board_collection
-            .piece_at_index(mv.from)
-            .map(|p| p.kind == PieceKind::King)
-            .unwrap_or(false);
-        let is_pinned = pin_info.pins.contains(mv.from);
-        let is_en_passant = mv.flags.contains(MoveFlags::EN_PASSANT);
+    let moves = MoveGen::filter_legal(moves, game, color);
 
-        let legal = if is_king || is_en_passant {
-            // always do full check
-            let undo = game.make_move(mv);
-            let legal = !game.board_collection.is_in_check(color);
-            game.undo_move(&undo);
-            legal
-        } else if is_pinned {
-            if check_info.in_check {
-                false
-            } else {
-                pin_info.pin_rays[mv.from as usize].contains(mv.to)
-            }
-        } else {
-            // must address check if in check
-            !check_info.in_check || check_info.check_mask.contains(mv.to)
-        };
-
-        if !legal {
-            continue;
-        }
-
+    for mv in moves.iter() {
         let undo = game.make_move(mv);
         let m = count_positions_n_deep(n - 1, game, false);
         game.undo_move(&undo);
