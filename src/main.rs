@@ -382,8 +382,8 @@ impl BitBoardCollection {
         self.get_board_mut(piece).remove(index);
     }
 
-    fn contains(&mut self, index: u8, piece: &ChessPiece) -> bool {
-        self.get_board_mut(piece).contains(index)
+    fn contains(&self, index: u8, piece: &ChessPiece) -> bool {
+        self.get_board(piece).contains(index)
     }
 
     fn occupied_color(&self, color: Color) -> BitBoard {
@@ -1317,33 +1317,72 @@ fn main() {
     let mut game = Game::from_fen(START_POS);
 
     loop {
-        let move_gen = MoveGen::new(&game);
-
         let input = take_input();
 
         if input.starts_with("position") {
             let parts = input.split_ascii_whitespace().collect::<Vec<&str>>();
+            let mut idx = 1;
+            let mut new_game;
+            if parts[idx] == "startpos" {
+                new_game = Game::from_fen(START_POS);
+            } else if parts[idx] == "fen" {
+                new_game = Game::from_fen(parts[2..=7].join(" ").as_str());
+                idx = 7;
+            } else {
+                continue;
+            }
+            idx += 1;
 
-            if parts[1] == "startpos" {
-                game = Game::from_fen(START_POS);
-            } else if parts[1] == "fen" {
-                // position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
-                // the fen is parts 2..=7
+            if parts.len() - 1 < idx || parts[idx] != "moves" {
+                game = new_game;
+                continue;
+            }
+            idx += 1;
 
-                let mut new_game = Game::from_fen(parts[2..=7].join(" ").as_str());
-                let move_gen = MoveGen::new(&new_game);
+            for mv in parts[idx..].iter() {
+                println!("{}", mv);
 
-                if parts.len() < 9 || parts[8] != "moves" {
-                    game = new_game;
+                if mv.len() < 4 {
                     continue;
                 }
+                let from = BC::decode_notation(&mv[0..2]);
+                let to = BC::decode_notation(&mv[2..4]);
+                let promo = mv.chars().nth(4);
+                let color = if new_game.white_turn {
+                    Color::White
+                } else {
+                    Color::Black
+                };
+                let move_gen = MoveGen::new(&new_game);
+                let actual_move = move_gen
+                    .pseudo_legal_moves(color)
+                    .into_iter()
+                    .filter(|m| {
+                        let undo = new_game.make_move(m);
+                        let legal = !new_game.board_collection.is_in_check(color);
+                        new_game.undo_move(&undo);
+                        legal
+                    })
+                    .find(|m| {
+                        m.from == from
+                            && m.to == to
+                            && match promo {
+                                Some('q') => m.flags.contains(MoveFlags::PROMOTE_Q),
+                                Some('r') => m.flags.contains(MoveFlags::PROMOTE_R),
+                                Some('n') => m.flags.contains(MoveFlags::PROMOTE_N),
+                                Some('b') => m.flags.contains(MoveFlags::PROMOTE_B),
+                                None => true,
+                                _ => false,
+                            }
+                    });
 
-                for mv in parts[9..parts.len()].iter() {
-                    if mv.len() != 4 {
-                        continue;
-                    }
+                if let Some(m) = actual_move {
+                    new_game.make_move(&m);
+                    println!("{}", new_game.board_collection);
                 }
             }
+
+            game = new_game;
         }
 
         if input.starts_with("go perft") {
