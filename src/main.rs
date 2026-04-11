@@ -57,6 +57,9 @@ impl Color {
             Color::Black => 0..=7,
         }
     }
+    fn kind(&self, kind: PieceKind) -> ChessPiece {
+        ChessPiece { kind, color: *self }
+    }
 }
 
 impl Not for Color {
@@ -213,10 +216,15 @@ struct BitBoardCollection {
     // 6 pieces, 2 colours
     piece_boards: [[BitBoard; 6]; 2],
     mailbox: [Option<ChessPiece>; 64],
+}
+
+#[derive(Clone, Copy)]
+struct PinInfo {
     pins: BitBoard,
     pin_rays: [BitBoard; 64],
 }
 
+#[derive(Clone, Copy)]
 struct CheckInfo {
     in_check: bool,
     check_mask: BitBoard,
@@ -230,8 +238,6 @@ impl BitBoardCollection {
         Self {
             piece_boards: [[BitBoard(0); 6]; 2],
             mailbox: [None; 64],
-            pins: BitBoard(0),
-            pin_rays: [BitBoard(0); 64],
         }
     }
 
@@ -258,6 +264,179 @@ impl BitBoardCollection {
         }
 
         king_bb & attacks.0 != 0
+    }
+
+    fn pin_info(&self, color: Color) -> PinInfo {
+        let king = self
+            .get_board(&ChessPiece {
+                kind: PieceKind::King,
+                color,
+            })
+            .0
+            .trailing_zeros();
+        let mut pins = BitBoard(0);
+        let mut pin_rays = [BitBoard(!0); 64];
+
+        let diagonals = BitBoard(
+            self.get_board(&ChessPiece {
+                kind: PieceKind::Bishop,
+                color: !color,
+            })
+            .0 | self
+                .get_board(&ChessPiece {
+                    kind: PieceKind::Queen,
+                    color: !color,
+                })
+                .0,
+        );
+
+        let orthogonals = BitBoard(
+            self.get_board(&ChessPiece {
+                kind: PieceKind::Rook,
+                color: !color,
+            })
+            .0 | self
+                .get_board(&ChessPiece {
+                    kind: PieceKind::Queen,
+                    color: !color,
+                })
+                .0,
+        );
+
+        for (directions, attackers) in [
+            (&ROOK_DIRECTIONS[..], orthogonals),
+            (&BISHOP_DIRECTIONS[..], diagonals),
+        ] {
+            for &(df, dr) in directions {
+                let (mut f, mut r) = BC::decode_tile(king as u8);
+                let (mut f, mut r) = (f as i8, r as i8);
+
+                let mut ray = BitBoard(0);
+                let mut potential_pin: Option<u8> = None;
+
+                loop {
+                    f += df;
+                    r += dr;
+
+                    if !(0..8).contains(&f) || !(0..8).contains(&r) {
+                        // Out of bounds
+                        break;
+                    }
+
+                    let sq = BC::encode_tile(f as u8, r as u8);
+                    ray.insert(sq);
+
+                    if let Some(piece) = self.piece_at_index(sq) {
+                        if piece.color == color {
+                            if potential_pin.is_none() {
+                                // Ray hits our piece first, could be pin
+                                potential_pin = Some(sq);
+                            } else {
+                                // Already hit our piece, cant be a pin
+                                break;
+                            }
+                        } else {
+                            // Either we already hit our piece, or this isnt a pin.
+                            if let Some(pinned_sq) = potential_pin {
+                                if attackers.contains(sq) {
+                                    pins.insert(pinned_sq);
+                                    pin_rays[pinned_sq as usize] = ray;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        PinInfo { pins, pin_rays }
+    }
+
+    fn check_info(&self, color: Color) -> CheckInfo {
+        let mut check_mask = BitBoard(!0);
+        let mut num_checkers: u8 = 0;
+
+        let king_sq = self
+            .get_board(&ChessPiece {
+                kind: PieceKind::King,
+                color,
+            })
+            .0
+            .trailing_zeros() as u8;
+
+        let pawn_checkers = BitBoard(
+            self.pawn_attacks(king_sq, color).0 & self.get_board(&(!color).kind(PieceKind::Pawn)).0,
+        );
+
+        if !pawn_checkers.is_empty() {
+            num_checkers += pawn_checkers.0.count_ones() as u8;
+            // Kill the pawn
+            check_mask = pawn_checkers
+        }
+
+        let knight_checkers = BitBoard(
+            self.knight_attacks(king_sq).0 & self.get_board(&(!color).kind(PieceKind::Knight)).0,
+        );
+
+        if !knight_checkers.is_empty() {
+            num_checkers += knight_checkers.0.count_ones() as u8;
+            // Kill the knight
+            check_mask = knight_checkers;
+        }
+
+        let dia_checkers = BitBoard(
+            self.bishop_attacks(king_sq).0
+                & (self.get_board(&(!color).kind(PieceKind::Bishop)).0
+                    | self.get_board(&(!color).kind(PieceKind::Queen)).0),
+        );
+
+        if !dia_checkers.is_empty() {
+            num_checkers += dia_checkers.0.count_ones() as u8;
+            let checker_sq = dia_checkers.0.trailing_zeros() as u8;
+            check_mask = self.ray_between(king_sq, checker_sq);
+            check_mask.insert(checker_sq);
+        }
+
+        let ortho_checkers = BitBoard(
+            self.rook_attacks(king_sq).0
+                & (self.get_board(&(!color).kind(PieceKind::Rook)).0
+                    | self.get_board(&(!color).kind(PieceKind::Queen)).0),
+        );
+
+        if !ortho_checkers.is_empty() {
+            num_checkers += ortho_checkers.0.count_ones() as u8;
+            let checker_sq = ortho_checkers.0.trailing_zeros() as u8;
+            check_mask = self.ray_between(king_sq, checker_sq);
+            check_mask.insert(checker_sq);
+        }
+
+        CheckInfo {
+            in_check: num_checkers > 0,
+            check_mask: if num_checkers == 0 {
+                BitBoard(!0u64)
+            } else if num_checkers == 1 {
+                check_mask
+            } else {
+                BitBoard(0)
+            },
+            num_checkers,
+        }
+    }
+
+    fn ray_between(&self, from: u8, to: u8) -> BitBoard {
+        let (ff, fr) = BC::decode_tile(from);
+        let (tf, tr) = BC::decode_tile(to);
+        let df = (tf as i8 - ff as i8).signum();
+        let dr = (tr as i8 - fr as i8).signum();
+        let mut ray = BitBoard(0);
+        let (mut f, mut r) = (ff as i8 + df, fr as i8 + dr);
+        while (f as u8, r as u8) != (tf, tr) {
+            ray.insert(BC::encode_tile(f as u8, r as u8));
+            f += df;
+            r += dr;
+        }
+        ray
     }
 
     fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
@@ -1407,6 +1586,18 @@ fn main() {
             )
         }
 
+        if input.starts_with("full perft") {
+            for n in 0..7 {
+                let track = Instant::now();
+                println!(
+                    "{}: {} ({}s)",
+                    n + 1,
+                    count_positions_n_deep(n + 1, &mut game, false),
+                    track.elapsed().as_secs_f32()
+                )
+            }
+        }
+
         if input == "d" {
             println!("{}", game.board_collection);
             println!("Fen: {}", game.into_fen());
@@ -1427,29 +1618,41 @@ fn count_positions_n_deep(n: u8, game: &mut Game, split: bool) -> u32 {
         Color::Black
     };
     let move_gen = MoveGen::new(game);
+    let check_info = game.board_collection.check_info(color);
+    let pin_info = game.board_collection.pin_info(color);
+
     let pseudo_moves = move_gen.pseudo_legal_moves(color);
 
-    let mut moves: Vec<Move> = pseudo_moves
-        .into_iter()
-        .filter(|mv| {
+    for mv in pseudo_moves.iter() {
+        let is_king = game
+            .board_collection
+            .piece_at_index(mv.from)
+            .map(|p| p.kind == PieceKind::King)
+            .unwrap_or(false);
+        let is_pinned = pin_info.pins.contains(mv.from);
+        let is_en_passant = mv.flags.contains(MoveFlags::EN_PASSANT);
+
+        let legal = if is_king || is_en_passant {
+            // always do full check
             let undo = game.make_move(mv);
             let legal = !game.board_collection.is_in_check(color);
             game.undo_move(&undo);
             legal
-        })
-        .collect();
+        } else if is_pinned {
+            if check_info.in_check {
+                false
+            } else {
+                pin_info.pin_rays[mv.from as usize].contains(mv.to)
+            }
+        } else {
+            // must address check if in check
+            !check_info.in_check || check_info.check_mask.contains(mv.to)
+        };
 
-    if split {
-        moves.sort_by(|a, b| {
-            let mut a_s = BC::encode_notation(a.from);
-            a_s.extend(BC::encode_notation(a.to).chars());
-            let mut b_s = BC::encode_notation(b.from);
-            b_s.extend(BC::encode_notation(b.to).chars());
-            a_s.cmp(&b_s)
-        });
-    }
+        if !legal {
+            continue;
+        }
 
-    for mv in moves.iter() {
         let undo = game.make_move(mv);
         let m = count_positions_n_deep(n - 1, game, false);
         game.undo_move(&undo);
