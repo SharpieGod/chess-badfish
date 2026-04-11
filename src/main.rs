@@ -213,6 +213,14 @@ struct BitBoardCollection {
     // 6 pieces, 2 colours
     piece_boards: [[BitBoard; 6]; 2],
     mailbox: [Option<ChessPiece>; 64],
+    pins: BitBoard,
+    pin_rays: [BitBoard; 64],
+}
+
+struct CheckInfo {
+    in_check: bool,
+    check_mask: BitBoard,
+    num_checkers: u8,
 }
 
 use BitBoardCollection as BC;
@@ -222,6 +230,8 @@ impl BitBoardCollection {
         Self {
             piece_boards: [[BitBoard(0); 6]; 2],
             mailbox: [None; 64],
+            pins: BitBoard(0),
+            pin_rays: [BitBoard(0); 64],
         }
     }
 
@@ -1353,6 +1363,7 @@ fn main() {
                 } else {
                     Color::Black
                 };
+
                 let move_gen = MoveGen::new(&new_game);
                 let actual_move = move_gen
                     .pseudo_legal_moves(color)
@@ -1378,7 +1389,6 @@ fn main() {
 
                 if let Some(m) = actual_move {
                     new_game.make_move(&m);
-                    println!("{}", new_game.board_collection);
                 }
             }
 
