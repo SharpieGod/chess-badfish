@@ -1781,7 +1781,7 @@ impl Engine {
                     PieceKind::Rook => 50,
                     PieceKind::Queen => 90,
                     PieceKind::King => 0,
-                } * 3;
+                } * 1;
 
                 mg[color_idx] += mg_val + material;
                 eg[color_idx] += eg_val + material;
@@ -1800,7 +1800,19 @@ impl Engine {
         (mg_score * mg_phase + eg_score * eg_phase) / 24
     }
 
-    fn search(&mut self, depth: u8) -> Option<Move> {
+    fn search(&mut self, max_depth: u8) -> Option<Move> {
+        let mut best_move = None;
+
+        for depth in 1..=max_depth {
+            if let Some(mv) = self.search_at_depth(depth) {
+                best_move = Some(mv);
+            }
+        }
+
+        best_move
+    }
+
+    fn search_at_depth(&mut self, depth: u8) -> Option<Move> {
         let mut alpha = -i32::MAX;
         let mut beta = i32::MAX;
         let mut best_move = None;
@@ -1842,6 +1854,9 @@ impl Engine {
 
     fn negamax(&mut self, depth: u8, mut alpha: i32, mut beta: i32) -> i32 {
         let hash = self.game.hash;
+        if self.history.get(&hash).copied().unwrap_or(0) >= 2 {
+            return 0;
+        }
         let original_alpha = alpha;
         let tt_idx = (hash as usize) & (self.tt.len() - 1);
 
@@ -1857,13 +1872,11 @@ impl Engine {
                 }
             }
         }
-        if self.history.get(&hash).copied().unwrap_or(0) >= 2 {
-            return 0;
-        }
-        *self.history.entry(hash).or_insert(0) += 1;
         if depth == 0 {
             return self.static_eval();
         }
+
+        *self.history.entry(hash).or_insert(0) += 1;
 
         let color = if self.game.white_turn {
             Color::White
@@ -1914,12 +1927,6 @@ impl Engine {
                 best_move = Some(*m);
             }
         }
-        if let Some(count) = self.history.get_mut(&hash) {
-            *count -= 1;
-            if *count == 0 {
-                self.history.remove(&hash);
-            }
-        }
 
         let flag = if alpha >= beta {
             TTFlag::LowerBound
@@ -1936,6 +1943,12 @@ impl Engine {
             flag,
             best_move,
         });
+        if let Some(count) = self.history.get_mut(&hash) {
+            *count -= 1;
+            if *count == 0 {
+                self.history.remove(&hash);
+            }
+        }
 
         alpha
     }
@@ -1983,7 +1996,7 @@ fn main() {
             let depth = if parts.len() > 2 && parts[1] == "depth" {
                 parts[2].parse::<u8>().unwrap_or(4)
             } else {
-                6
+                64
             };
 
             if let Some(mv) = engine.search(depth) {
