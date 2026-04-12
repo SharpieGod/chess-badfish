@@ -1841,9 +1841,9 @@ impl Engine {
             let score = self.last_score; // add this field to Engine
 
             let score_str = if score >= 900000 {
-                format!("mate {}", (1000000 - score + 1) / 2)
+                format!("mate {}", depth / 2)
             } else if score <= -900000 {
-                format!("mate -{}", (1000000 + score + 1) / 2)
+                format!("mate -{}", depth / 2)
             } else {
                 format!("cp {}", score)
             };
@@ -2044,6 +2044,7 @@ impl Engine {
             flag,
             best_move,
         });
+
         if let Some(count) = self.history.get_mut(&hash) {
             *count -= 1;
             if *count == 0 {
@@ -2078,7 +2079,7 @@ impl Engine {
             Color::Black
         };
 
-        let mut moves = MoveGen::new(&self.game)
+        let moves = MoveGen::new(&self.game)
             .pseudo_legal_moves(color)
             .into_iter()
             .filter(|m| m.flags.contains(MoveFlags::CAPTURE))
@@ -2208,7 +2209,7 @@ fn main() {
                 64
             };
 
-            if let Some(mv) = engine.search(depth, 200) {
+            if let Some(mv) = engine.search(depth, 5000) {
                 let mut mv_s = BC::encode_notation(mv.from);
                 mv_s.extend(BC::encode_notation(mv.to).chars());
                 let promo = if mv.flags.contains(MoveFlags::PROMOTE_Q) {
