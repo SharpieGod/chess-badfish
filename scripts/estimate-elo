@@ -1,0 +1,14 @@
+#!/bin/bash
+cutechess-cli \
+  -engine cmd=./target/release/chess-badfish name=BadFish proto=uci \
+  -engine cmd=stockfish name=SF proto=uci \
+    option.UCI_LimitStrength=true \
+    option.UCI_Elo=1320 \
+    option.Ponder=false \
+  -each tc=10+0.1 \
+  -games 40 \
+  -repeat \
+  -rounds 10 \
+  -concurrency 10 \
+  -resign movecount=5 score=600 \
+  -pgnout weak_test.pgn

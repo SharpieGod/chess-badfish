@@ -1,8 +1,9 @@
-use core::f64;
+use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
     f32::MIN,
     fmt::{self, Display},
+    fs::OpenOptions,
     i32, io, mem,
     ops::{BitAnd, BitOr, Index, Not, RangeInclusive},
     sync::OnceLock,
@@ -256,6 +257,24 @@ impl BitBoardCollection {
             piece_boards: [[BitBoard(0); 6]; 2],
             mailbox: [None; 64],
         }
+    }
+
+    fn attacks_by(&self, color: Color) -> BitBoard {
+        let mut attacks = BitBoard(0);
+
+        for kind in 0..6 {
+            let piece = ChessPiece {
+                kind: kind.try_into().unwrap(),
+                color,
+            };
+            let mut bb = *self.get_board(&piece);
+
+            while let Some(index) = bb.pop_lsb() {
+                attacks.0 |= self.piece_attacks(index, piece).0;
+            }
+        }
+
+        attacks
     }
 
     fn is_in_check(&self, color: Color) -> bool {
@@ -771,9 +790,9 @@ impl<'a> MoveGen<'a> {
         };
 
         if game.white_turn {
-            mg.black_attacks = mg.compute_attacks(Color::Black);
+            mg.black_attacks = mg.bc.attacks_by(Color::Black);
         } else {
-            mg.white_attacks = mg.compute_attacks(Color::White);
+            mg.white_attacks = mg.bc.attacks_by(Color::White);
         }
 
         mg.white_occ = game.board_collection.occupied_color(Color::White);
@@ -821,24 +840,6 @@ impl<'a> MoveGen<'a> {
             Color::White => self.white_occ,
             Color::Black => self.black_occ,
         }
-    }
-
-    fn compute_attacks(&self, color: Color) -> BitBoard {
-        let mut attacks = BitBoard(0);
-
-        for kind in 0..6 {
-            let piece = ChessPiece {
-                kind: kind.try_into().unwrap(),
-                color,
-            };
-            let mut bb = *self.bc.get_board(&piece);
-
-            while let Some(index) = bb.pop_lsb() {
-                attacks.0 |= self.piece_attacks(index, piece).0;
-            }
-        }
-
-        attacks
     }
 
     fn attacks_by(&self, color: Color) -> BitBoard {
@@ -1018,6 +1019,7 @@ impl<'a> MoveGen<'a> {
 
         while let Some(to) = captures.pop_lsb() {
             let is_en_passant = self.game.en_passant_square == Some(to);
+
             let ep = if is_en_passant {
                 MoveFlags::EN_PASSANT
             } else {
@@ -1767,6 +1769,35 @@ static EG_KING_TABLE: [i32; 64] = [
 static GAMEPHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0]; // pawn, knight, bishop, rook, queen, king
 
 impl Engine {
+    fn hanging_penalty(&self, color: Color) -> i32 {
+        let bc = &self.game.board_collection;
+        let enemy_attacks = bc.attacks_by(!color);
+        let friendly_attacks = bc.attacks_by(color);
+
+        let mut penalty = 0;
+        let mut our_pieces = bc.occupied_color(color);
+
+        while let Some(sq) = our_pieces.pop_lsb() {
+            if bc.piece_at_index(sq) == None {
+                println!("{}", bc.occupied_color(color));
+                println!("{:?}", bc.mailbox);
+                println!("{}", sq);
+
+                panic!()
+            }
+
+            let piece = bc.piece_at_index(sq).unwrap();
+            if piece.kind == PieceKind::King {
+                continue;
+            }
+            if enemy_attacks.contains(sq) && !friendly_attacks.contains(sq) {
+                penalty += piece.kind.value() as i32 / 2;
+            }
+        }
+
+        penalty
+    }
+
     fn static_eval(&self) -> i32 {
         let mut mg = [0; 2];
         let mut eg = [0; 2];
@@ -1815,7 +1846,14 @@ impl Engine {
         let mg_phase = game_phase.min(24);
         let eg_phase = 24 - mg_phase;
 
-        (mg_score * mg_phase + eg_score * eg_phase) / 24
+        let side = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let hanging = self.hanging_penalty(side) - self.hanging_penalty(!side);
+
+        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
     }
 
     fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
@@ -1957,12 +1995,53 @@ impl Engine {
         if depth == 0 {
             return self.quiescence(alpha, beta);
         }
-
         let color = if self.game.white_turn {
             Color::White
         } else {
             Color::Black
         };
+        let in_check = self.game.board_collection.check_info(color).in_check;
+
+        // Null move pruning
+        if !in_check && depth >= 3 {
+            // If has any piece other than pawns
+            let mut pieces = self.game.board_collection.occupied_color(color);
+            let mut has_non_pawns = false;
+
+            while let Some(idx) = pieces.pop_lsb() {
+                let kind = self.game.board_collection.mailbox[idx as usize]
+                    .unwrap()
+                    .kind;
+                if ![PieceKind::King, PieceKind::Pawn].contains(&kind) {
+                    has_non_pawns = true;
+                    break;
+                }
+            }
+
+            if has_non_pawns {
+                let prev_hash = self.game.hash;
+                self.game.white_turn = !self.game.white_turn;
+                self.game.hash ^= zobrist().black_to_move;
+                let prev_ep = self.game.en_passant_square;
+                if let Some(ep) = self.game.en_passant_square {
+                    let (file, _) = BC::decode_tile(ep);
+                    self.game.hash ^= zobrist().en_passant[file as usize];
+                }
+
+                self.game.en_passant_square = None;
+
+                let score = -self.negamax(depth - 3, -beta, -beta + 1, start, deadline);
+
+                self.game.white_turn = !self.game.white_turn;
+                self.game.en_passant_square = prev_ep;
+                self.game.hash = prev_hash;
+
+                // Position so good, that oponent wouldnt let us reach it
+                if score >= beta {
+                    return beta;
+                }
+            }
+        }
 
         let moves = {
             let move_gen = MoveGen::new(&self.game);
@@ -1973,13 +2052,13 @@ impl Engine {
         let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
 
         if moves.is_empty() {
-            if self.game.board_collection.check_info(color).in_check {
-                // eprintln!("checkmate detected");
+            if in_check {
                 return -1000000;
             }
-            // eprintln!("stalemate detected");
             return 0;
         }
+        moves.sort_by_key(|m| -self.capture_score(m));
+
         *self.history.entry(hash).or_insert(0) += 1;
         let mut best_move = None;
 
@@ -2105,9 +2184,13 @@ impl Engine {
     }
 
     fn capture_score(&self, m: &Move) -> i32 {
+        if !m.flags.contains(MoveFlags::CAPTURE) {
+            return 0;
+        }
         if m.flags.contains(MoveFlags::EN_PASSANT) {
             return PieceKind::Pawn.value() as i32;
         }
+
         let capture = self
             .game
             .board_collection
@@ -2200,6 +2283,18 @@ fn main() {
         if input == "eval" {
             engine.debug_eval();
         }
+        if input.starts_with("go perft") {
+            let track = Instant::now();
+            let n = input.split_whitespace().collect::<Vec<&str>>()[2]
+                .parse::<u8>()
+                .unwrap_or(0);
+            println!(
+                "\ntotal: {} ({}s)",
+                count_positions_n_deep(n, &mut engine.game, true),
+                track.elapsed().as_secs_f32()
+            );
+            continue;
+        }
 
         if input.starts_with("go") {
             let parts = input.split_whitespace().collect::<Vec<&str>>();
@@ -2209,7 +2304,21 @@ fn main() {
                 64
             };
 
-            if let Some(mv) = engine.search(depth, 5000) {
+            let time_ms = if engine.game.white_turn {
+                parts
+                    .windows(2)
+                    .find(|w| w[0] == "wtime")
+                    .and_then(|w| w[1].parse::<u64>().ok())
+            } else {
+                parts
+                    .windows(2)
+                    .find(|w| w[0] == "btime")
+                    .and_then(|w| w[1].parse::<u64>().ok())
+            }
+            .map(|t| t / 20) // use 1/20th of remaining time per move
+            .unwrap_or(5000);
+
+            if let Some(mv) = engine.search(depth, time_ms) {
                 let mut mv_s = BC::encode_notation(mv.from);
                 mv_s.extend(BC::encode_notation(mv.to).chars());
                 let promo = if mv.flags.contains(MoveFlags::PROMOTE_Q) {
@@ -2224,7 +2333,7 @@ fn main() {
                     ""
                 };
 
-                println!("bestmove {}{}", mv_s, promo)
+                println!("bestmove {}{}", mv_s, promo);
             }
         }
 
@@ -2292,18 +2401,6 @@ fn main() {
             }
 
             engine.game = new_game;
-        }
-
-        if input.starts_with("go perft") {
-            let track = Instant::now();
-            let n = input.split_whitespace().collect::<Vec<&str>>()[2]
-                .parse::<u8>()
-                .unwrap_or(0);
-            println!(
-                "\ntotal: {} ({}s)",
-                count_positions_n_deep(n, &mut engine.game, true),
-                track.elapsed().as_secs_f32()
-            )
         }
 
         if input.starts_with("full perft") {
