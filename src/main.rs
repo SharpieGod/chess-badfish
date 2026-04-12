@@ -35,6 +35,19 @@ impl TryFrom<usize> for PieceKind {
     }
 }
 
+impl PieceKind {
+    fn value(&self) -> u32 {
+        match self {
+            PieceKind::Pawn => 100,
+            PieceKind::Knight => 300,
+            PieceKind::Bishop => 300,
+            PieceKind::Rook => 500,
+            PieceKind::Queen => 900,
+            PieceKind::King => 0,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Color {
     White,
@@ -1253,7 +1266,7 @@ impl Game {
         let fifty_move_rule = parts[4].parse::<u32>().unwrap_or(0);
         let game_move = parts[5].parse::<u16>().unwrap_or(0);
 
-        Self {
+        let mut game = Self {
             board_collection: BitBoardCollection::from_fen(
                 // "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
                 // "r2qk2r/2p2ppp/p1n1bn2/1p1pp3/3P4/2N1PN2/PPP1BPPP/R2QK2R w KQkq - 0 9",
@@ -1268,7 +1281,11 @@ impl Game {
             fifty_move_rule,
             move_count: game_move,
             hash: 0,
-        }
+        };
+
+        game.hash = zobrist().hash(&game);
+
+        game
     }
 
     fn into_fen(&self) -> String {
@@ -1775,13 +1792,13 @@ impl Engine {
 
                 // Base material
                 let material = match piece.kind {
-                    PieceKind::Pawn => 10,
-                    PieceKind::Knight => 30,
-                    PieceKind::Bishop => 30,
-                    PieceKind::Rook => 50,
-                    PieceKind::Queen => 90,
+                    PieceKind::Pawn => 100,
+                    PieceKind::Knight => 300,
+                    PieceKind::Bishop => 300,
+                    PieceKind::Rook => 500,
+                    PieceKind::Queen => 900,
                     PieceKind::King => 0,
-                } * 12;
+                };
 
                 mg[color_idx] += mg_val + material;
                 eg[color_idx] += eg_val + material;
@@ -1804,6 +1821,7 @@ impl Engine {
         let mut best_move = None;
 
         for depth in 1..=max_depth {
+            self.history.clear();
             if let Some(mv) = self.search_at_depth(depth) {
                 best_move = Some(mv);
             }
@@ -1841,6 +1859,11 @@ impl Engine {
         for mv in moves.iter() {
             let undo = self.game.make_move(mv);
             let score = -self.negamax(depth - 1, -beta, -alpha);
+            let mut mv_s = BC::encode_notation(mv.from);
+            mv_s.extend(BC::encode_notation(mv.to).chars());
+            // println!("{}", mv_s);
+            // self.debug_eval();
+            // println!();
             self.game.undo_move(&undo);
 
             if score > alpha {
@@ -1873,7 +1896,7 @@ impl Engine {
             }
         }
         if depth == 0 {
-            return self.static_eval();
+            return self.quiescence(alpha, beta);
         }
 
         *self.history.entry(hash).or_insert(0) += 1;
@@ -1893,7 +1916,7 @@ impl Engine {
         let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
 
         if moves.is_empty() {
-            if self.game.board_collection.is_in_check(color) {
+            if self.game.board_collection.check_info(color).in_check {
                 return -1000000;
             }
             return 0;
@@ -1904,7 +1927,7 @@ impl Engine {
             let u = self.game.make_move(m);
             // who is oponent swaps
             let mut extensions = 0;
-            if self.game.board_collection.is_in_check(!color) {
+            if self.game.board_collection.check_info(!color).in_check {
                 extensions += 1;
             }
 
@@ -1952,6 +1975,88 @@ impl Engine {
 
         alpha
     }
+
+    fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
+        let stand_pat = self.static_eval();
+
+        if stand_pat >= beta {
+            return beta;
+        }
+        if stand_pat > alpha {
+            alpha = stand_pat;
+        }
+
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+
+        let mut moves = MoveGen::new(&self.game)
+            .pseudo_legal_moves(color)
+            .into_iter()
+            .filter(|m| m.flags.contains(MoveFlags::CAPTURE))
+            .collect::<Vec<_>>();
+
+        moves.sort_by_key(|m| -self.capture_score(m));
+
+        for m in moves {
+            let u = self.game.make_move(&m);
+            let score = -self.quiescence(-beta, -alpha);
+            self.game.undo_move(&u);
+
+            if score >= beta {
+                return beta;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+        }
+
+        alpha
+    }
+
+    fn capture_score(&self, m: &Move) -> i32 {
+        if m.flags.contains(MoveFlags::EN_PASSANT) {
+            return PieceKind::Pawn.value() as i32;
+        }
+        let capture = self
+            .game
+            .board_collection
+            .piece_at_index(m.to)
+            .unwrap()
+            .kind
+            .value();
+        let attacker = self
+            .game
+            .board_collection
+            .piece_at_index(m.from)
+            .unwrap()
+            .kind
+            .value();
+
+        capture as i32 - attacker as i32
+    }
+
+    fn debug_eval(&self) {
+        println!("Static eval: {}", self.static_eval());
+        println!("White material: {}", self.material_score(Color::White));
+        println!("Black material: {}", self.material_score(Color::Black));
+        println!("Hash: {}", self.game.hash);
+        println!("Hash check: {}", zobrist().hash(&self.game));
+    }
+
+    fn material_score(&self, color: Color) -> i32 {
+        let mut score = 0;
+        for sq in 0..64u8 {
+            if let Some(piece) = self.game.board_collection.piece_at_index(sq) {
+                if piece.color == color {
+                    score += piece.kind.value();
+                }
+            }
+        }
+        score as i32
+    }
 }
 
 fn clear() {
@@ -1988,7 +2093,15 @@ fn main() {
         }
 
         if input == "ucinewgame" {
-            engine.game = Game::from_fen(START_POS);
+            engine = Engine {
+                game: Game::from_fen(START_POS),
+                history: HashMap::new(),
+                tt: vec![None; 1 << 20],
+            };
+        }
+
+        if input == "eval" {
+            engine.debug_eval();
         }
 
         if input.starts_with("go") {
@@ -1996,7 +2109,7 @@ fn main() {
             let depth = if parts.len() > 2 && parts[1] == "depth" {
                 parts[2].parse::<u8>().unwrap_or(4)
             } else {
-                64
+                5
             };
 
             if let Some(mv) = engine.search(depth) {
