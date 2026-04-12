@@ -1522,9 +1522,27 @@ impl Game {
         self.fifty_move_rule = u.prev_fifty_move_counter;
         self.en_passant_square = u.en_passant_square;
 
+        let is_promotion = u.mv.flags.intersects(
+            MoveFlags::PROMOTE_Q
+                | MoveFlags::PROMOTE_R
+                | MoveFlags::PROMOTE_N
+                | MoveFlags::PROMOTE_B,
+        );
+
         let piece_from = self.board_collection.piece_at_index(u.mv.to).unwrap();
         self.board_collection.remove(u.mv.to, &piece_from);
-        self.board_collection.insert(u.mv.from, &piece_from);
+
+        if is_promotion {
+            self.board_collection.insert(
+                u.mv.from,
+                &ChessPiece {
+                    kind: PieceKind::Pawn,
+                    color,
+                },
+            );
+        } else {
+            self.board_collection.insert(u.mv.from, &piece_from);
+        }
 
         if !u.mv.flags.contains(MoveFlags::EN_PASSANT) && u.mv.flags.contains(MoveFlags::CAPTURE) {
             self.board_collection
@@ -1539,47 +1557,26 @@ impl Game {
             );
         }
 
-        if u.mv.flags.intersects(
-            MoveFlags::PROMOTE_Q
-                | MoveFlags::PROMOTE_R
-                | MoveFlags::PROMOTE_N
-                | MoveFlags::PROMOTE_B,
-        ) {
-            self.board_collection.remove(u.mv.from, &piece_from);
-            self.board_collection.insert(
-                u.mv.from,
-                &ChessPiece {
-                    kind: PieceKind::Pawn,
-                    color,
-                },
-            );
-        }
-
         let prev = u.rights;
         self.k_white = prev & 1 != 0;
         self.q_white = prev & 2 != 0;
         self.k_black = prev & 4 != 0;
         self.q_black = prev & 8 != 0;
 
-        // King already moved, just need to move rook
         if u.mv.flags.contains(MoveFlags::CASTLE_KING) {
-            // King side, so rook is left of king
             let rook = ChessPiece {
                 kind: PieceKind::Rook,
                 color,
             };
-
             self.board_collection.remove(u.mv.to - 1, &rook);
             self.board_collection.insert(u.mv.to + 1, &rook);
         }
 
         if u.mv.flags.contains(MoveFlags::CASTLE_QUEEN) {
-            // King side, so rook is left of king
             let rook = ChessPiece {
                 kind: PieceKind::Rook,
                 color,
             };
-
             self.board_collection.remove(u.mv.to + 1, &rook);
             self.board_collection.insert(u.mv.to - 2, &rook);
         }
@@ -1685,6 +1682,10 @@ struct Engine {
     game: Game,
     history: HashMap<u64, u8>,
     tt: Vec<Option<TTEntry>>,
+    nodes: u64,
+    game_history: HashMap<u64, u8>,
+    last_score: i32,
+    stop: bool,
 }
 
 // Values from PeSTO
@@ -1817,20 +1818,50 @@ impl Engine {
         (mg_score * mg_phase + eg_score * eg_phase) / 24
     }
 
-    fn search(&mut self, max_depth: u8) -> Option<Move> {
+    fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
+        self.tt.iter_mut().for_each(|e| *e = None);
+        let start = Instant::now();
         let mut best_move = None;
+        self.nodes = 0;
+        self.stop = false;
+        let deadline = time_ms;
 
         for depth in 1..=max_depth {
             self.history.clear();
-            if let Some(mv) = self.search_at_depth(depth) {
+
+            if let Some(mv) = self.search_at_depth(depth, &start, deadline) {
                 best_move = Some(mv);
+            }
+
+            if self.stop {
+                break;
+            }
+
+            let elapsed = start.elapsed().as_millis();
+            let score = self.last_score; // add this field to Engine
+
+            let score_str = if score >= 900000 {
+                format!("mate {}", (1000000 - score + 1) / 2)
+            } else if score <= -900000 {
+                format!("mate -{}", (1000000 + score + 1) / 2)
+            } else {
+                format!("cp {}", score)
+            };
+
+            println!(
+                "info depth {} score {} nodes {} time {}",
+                depth, score_str, self.nodes, elapsed
+            );
+
+            if score >= 900000 || score <= -900000 {
+                break; // found mate, no need to search deeper
             }
         }
 
         best_move
     }
 
-    fn search_at_depth(&mut self, depth: u8) -> Option<Move> {
+    fn search_at_depth(&mut self, depth: u8, start: &Instant, deadline: u64) -> Option<Move> {
         let mut alpha = -i32::MAX;
         let mut beta = i32::MAX;
         let mut best_move = None;
@@ -1857,8 +1888,13 @@ impl Engine {
         });
 
         for mv in moves.iter() {
+            if start.elapsed().as_millis() as u64 >= deadline {
+                self.stop = true;
+                return None; // abort
+            }
+
             let undo = self.game.make_move(mv);
-            let score = -self.negamax(depth - 1, -beta, -alpha);
+            let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline);
             let mut mv_s = BC::encode_notation(mv.from);
             mv_s.extend(BC::encode_notation(mv.to).chars());
             // println!("{}", mv_s);
@@ -1869,17 +1905,40 @@ impl Engine {
             if score > alpha {
                 alpha = score;
                 best_move = Some(*mv);
+                self.last_score = alpha;
             }
         }
 
         best_move
     }
 
-    fn negamax(&mut self, depth: u8, mut alpha: i32, mut beta: i32) -> i32 {
-        let hash = self.game.hash;
-        if self.history.get(&hash).copied().unwrap_or(0) >= 2 {
+    fn negamax(
+        &mut self,
+        depth: u8,
+        mut alpha: i32,
+        mut beta: i32,
+        start: &Instant,
+        deadline: u64,
+    ) -> i32 {
+        if self.nodes & 2047 == 0 {
+            if start.elapsed().as_millis() as u64 >= deadline {
+                self.stop = true;
+            }
+        }
+
+        if self.stop {
             return 0;
         }
+
+        self.nodes += 1;
+        let hash = self.game.hash;
+        let search_count = self.history.get(&hash).copied().unwrap_or(0);
+        let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
+
+        if search_count >= 2 || game_count >= 3 {
+            return 0;
+        }
+
         let original_alpha = alpha;
         let tt_idx = (hash as usize) & (self.tt.len() - 1);
 
@@ -1899,8 +1958,6 @@ impl Engine {
             return self.quiescence(alpha, beta);
         }
 
-        *self.history.entry(hash).or_insert(0) += 1;
-
         let color = if self.game.white_turn {
             Color::White
         } else {
@@ -1917,21 +1974,36 @@ impl Engine {
 
         if moves.is_empty() {
             if self.game.board_collection.check_info(color).in_check {
+                // eprintln!("checkmate detected");
                 return -1000000;
             }
+            // eprintln!("stalemate detected");
             return 0;
         }
+        *self.history.entry(hash).or_insert(0) += 1;
         let mut best_move = None;
 
-        for m in moves.iter() {
+        for (i, m) in moves.iter().enumerate() {
             let u = self.game.make_move(m);
-            // who is oponent swaps
-            let mut extensions = 0;
-            if self.game.board_collection.check_info(!color).in_check {
-                extensions += 1;
-            }
 
-            let score = -self.negamax(depth - 1 + extensions, -beta, -alpha);
+            let score = if i >= 3
+                && depth >= 3
+                && !m.flags.contains(MoveFlags::CAPTURE)
+                && !m.flags.contains(MoveFlags::PROMOTE_Q)
+                && !self.game.board_collection.is_in_check(!color)
+            {
+                // Search at reduced depth first
+                let reduced = -self.negamax(depth - 2, -alpha - 1, -alpha, start, deadline);
+
+                // If it beats alpha, re-search at full depth
+                if reduced > alpha {
+                    -self.negamax(depth - 1, -beta, -alpha, start, deadline)
+                } else {
+                    reduced
+                }
+            } else {
+                -self.negamax(depth - 1, -beta, -alpha, start, deadline)
+            };
             self.game.undo_move(&u);
 
             if score >= beta {
@@ -1942,6 +2014,12 @@ impl Engine {
                     flag: TTFlag::LowerBound,
                     best_move: Some(*m),
                 });
+                if let Some(count) = self.history.get_mut(&hash) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.history.remove(&hash);
+                    }
+                }
                 return beta;
             }
 
@@ -1977,6 +2055,14 @@ impl Engine {
     }
 
     fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
+        let hash = self.game.hash;
+        let search_count = self.history.get(&hash).copied().unwrap_or(0);
+        let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
+
+        if search_count >= 2 || game_count >= 2 {
+            return 0;
+        }
+
         let stand_pat = self.static_eval();
 
         if stand_pat >= beta {
@@ -1998,6 +2084,7 @@ impl Engine {
             .filter(|m| m.flags.contains(MoveFlags::CAPTURE))
             .collect::<Vec<_>>();
 
+        let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
         moves.sort_by_key(|m| -self.capture_score(m));
 
         for m in moves {
@@ -2039,6 +2126,7 @@ impl Engine {
     }
 
     fn debug_eval(&self) {
+        // println!("{}", self.game.board_collection);
         println!("Static eval: {}", self.static_eval());
         println!("White material: {}", self.material_score(Color::White));
         println!("Black material: {}", self.material_score(Color::Black));
@@ -2076,7 +2164,11 @@ fn main() {
     let mut engine = Engine {
         game: Game::from_fen(START_POS),
         history: HashMap::new(),
+        game_history: HashMap::new(),
         tt: vec![None; 1 << 20],
+        last_score: 0,
+        stop: false,
+        nodes: 0,
     };
 
     loop {
@@ -2096,7 +2188,11 @@ fn main() {
             engine = Engine {
                 game: Game::from_fen(START_POS),
                 history: HashMap::new(),
+                game_history: HashMap::new(),
                 tt: vec![None; 1 << 20],
+                stop: false,
+                last_score: 0,
+                nodes: 0,
             };
         }
 
@@ -2109,10 +2205,10 @@ fn main() {
             let depth = if parts.len() > 2 && parts[1] == "depth" {
                 parts[2].parse::<u8>().unwrap_or(4)
             } else {
-                5
+                64
             };
 
-            if let Some(mv) = engine.search(depth) {
+            if let Some(mv) = engine.search(depth, 200) {
                 let mut mv_s = BC::encode_notation(mv.from);
                 mv_s.extend(BC::encode_notation(mv.to).chars());
                 let promo = if mv.flags.contains(MoveFlags::PROMOTE_Q) {
@@ -2132,6 +2228,7 @@ fn main() {
         }
 
         if input.starts_with("position") {
+            engine.game_history.clear();
             let parts = input.split_ascii_whitespace().collect::<Vec<&str>>();
             let mut idx = 1;
             let mut new_game;
@@ -2189,6 +2286,7 @@ fn main() {
 
                 if let Some(m) = actual_move {
                     new_game.make_move(&m);
+                    *engine.game_history.entry(new_game.hash).or_insert(0) += 1;
                 }
             }
 
