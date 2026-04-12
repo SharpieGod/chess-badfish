@@ -1781,7 +1781,7 @@ impl Engine {
                     PieceKind::Rook => 50,
                     PieceKind::Queen => 90,
                     PieceKind::King => 0,
-                } * 1;
+                } * 12;
 
                 mg[color_idx] += mg_val + material;
                 eg[color_idx] += eg_val + material;
