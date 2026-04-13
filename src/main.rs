@@ -232,7 +232,9 @@ impl Display for BitBoard {
 struct BitBoardCollection {
     // 6 pieces, 2 colours
     piece_boards: [[BitBoard; 6]; 2],
+    attacks: [[BitBoard; 6]; 2],
     mailbox: [Option<ChessPiece>; 64],
+    attacks_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +257,8 @@ impl BitBoardCollection {
     fn new() -> Self {
         Self {
             piece_boards: [[BitBoard(0); 6]; 2],
+            attacks: [[BitBoard(0); 6]; 2],
+            attacks_dirty: true,
             mailbox: [None; 64],
         }
     }
@@ -1975,9 +1979,28 @@ impl Engine {
         let pawns = self.pawn_bonus(friendly_pawns, enemy_pawns, color)
             - self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
 
+        let friendly_bishops = if self.game.white_turn {
+            white_bishops
+        } else {
+            black_bishops
+        };
+
+        let enemy_bishops = if self.game.white_turn {
+            black_bishops
+        } else {
+            white_bishops
+        };
+
+        let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
+        let control =
+            (friendly_attacks.0.count_ones() as i32 - enemy_attacks.0.count_ones() as i32) * 2;
+
         (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + king_safety + pawns
     }
 
+    fn bishop_bonus(&self, bishop_count: u8) -> i32 {
+        if bishop_count < 2 { 0 } else { 30 }
+    }
     fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
         self.tt.iter_mut().for_each(|e| *e = None);
         let start = Instant::now();
