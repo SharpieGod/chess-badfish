@@ -2337,6 +2337,9 @@ fn main() {
 
     loop {
         let input = take_input();
+        if input == "quit" {
+            std::process::exit(0);
+        }
 
         if input == "uci" {
             println!("id name BadFish");
