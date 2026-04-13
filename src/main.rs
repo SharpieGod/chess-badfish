@@ -1773,6 +1773,7 @@ static EG_KING_TABLE: [i32; 64] = [
 ];
 
 static GAMEPHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0]; // pawn, knight, bishop, rook, queen, king
+static PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 10, 20, 35, 55, 80, 120];
 
 impl Engine {
     fn hanging_penalty(
@@ -1811,6 +1812,57 @@ impl Engine {
         (around & friendly_pieces).0.count_ones() as i32 * 10
     }
 
+    fn pawn_bonus(&self, friendly_pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
+        // Passed pawns detection
+        let doubled_pawns_penalty = 20;
+        let file_mask = 0x0101010101010101;
+        let mut bonus = 0;
+
+        let mut friendly_pawns_clone = friendly_pawns;
+        while let Some(pawn_sq) = friendly_pawns_clone.pop_lsb() {
+            let (file, rank) = BC::decode_tile(pawn_sq);
+            let mut scan_mask = file_mask << file;
+            if file > 0 {
+                scan_mask |= file_mask << (file - 1);
+            }
+            if file < 7 {
+                scan_mask |= file_mask << (file + 1);
+            }
+            // Dont look behind pawn
+            if color == Color::White {
+                scan_mask &= !0u64 << (rank * 8); // mask out squares below
+            } else {
+                scan_mask &= !(!0u64 << (rank * 8)); // mask out squares above
+            }
+
+            scan_mask &= enemy_pawns.0;
+
+            // println!("{} {:?}", BitBoard(scan_mask), color);
+            if scan_mask == 0 {
+                let bonus_rank = if color == Color::White {
+                    rank
+                } else {
+                    7 - rank
+                } + 1;
+
+                bonus += PASSED_PAWN_BONUS[bonus_rank as usize];
+                // eprintln!(
+                //     "{} {:?} {}",
+                //     rank, color, PASSED_PAWN_BONUS[bonus_rank as usize]
+                // );
+            }
+        }
+
+        for file in 0..8 {
+            let pawns_on_file = (file_mask << file & friendly_pawns.0).count_ones();
+            if pawns_on_file > 1 {
+                bonus -= doubled_pawns_penalty * (pawns_on_file - 1) as i32;
+            }
+        }
+
+        bonus
+    }
+
     fn static_eval(&self) -> i32 {
         let color = if self.game.white_turn {
             Color::White
@@ -1828,6 +1880,9 @@ impl Engine {
         let mut game_phase = 0i32;
         let mut white_king_sq = 0;
         let mut black_king_sq = 0;
+
+        let mut white_bishops = 0;
+        let mut black_bishops = 0;
 
         for sq in 0..64u8 {
             if let Some(piece) = self.game.board_collection.piece_at_index(sq) {
@@ -1866,6 +1921,14 @@ impl Engine {
                     }
                 }
 
+                if piece.kind == PieceKind::Bishop {
+                    if piece.color == Color::White {
+                        white_bishops += 1;
+                    } else {
+                        black_bishops += 1;
+                    }
+                }
+
                 mg[color_idx] += mg_val + material;
                 eg[color_idx] += eg_val + material;
                 game_phase += GAMEPHASE_INC[piece.kind as usize];
@@ -1899,7 +1962,20 @@ impl Engine {
             * mg_phase
             / 24;
 
-        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + king_safety
+        let friendly_pawns = *self
+            .game
+            .board_collection
+            .get_board(&color.kind(PieceKind::Pawn));
+
+        let enemy_pawns = *self
+            .game
+            .board_collection
+            .get_board(&(!color).kind(PieceKind::Pawn));
+
+        let pawns = self.pawn_bonus(friendly_pawns, enemy_pawns, color)
+            - self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
+
+        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + king_safety + pawns
     }
 
     fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
@@ -2107,7 +2183,7 @@ impl Engine {
 
         if moves.is_empty() {
             if in_check {
-                return -1000000;
+                return -(1000000 - depth as i32);
             }
             return 0;
         }
