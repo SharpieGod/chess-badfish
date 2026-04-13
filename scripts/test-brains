@@ -1,10 +1,10 @@
 #!/bin/bash
 cutechess-cli \
-  -engine cmd=./saved-brains/v0 name=BadFish0 proto=uci \
   -engine cmd=./saved-brains/v1 name=BadFish1 proto=uci \
+  -engine cmd=./saved-brains/v2 name=BadFish2 proto=uci \
   -each tc=10+0.1 \
   -games 40 \
   -repeat \
   -rounds 10 \
   -concurrency 10 \
-  -resign movecount=5 score=600 \
+  # -resign movecount=5 score=600 \

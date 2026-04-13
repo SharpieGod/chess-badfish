@@ -1359,6 +1359,12 @@ impl Game {
 
         let piece_from = self.board_collection.piece_at_index(m.from).unwrap();
 
+        if piece_from.kind == PieceKind::Pawn || m.flags.contains(MoveFlags::CAPTURE) {
+            self.fifty_move_rule = 0;
+        } else {
+            self.fifty_move_rule += 1;
+        }
+
         let color = if self.white_turn {
             Color::White
         } else {
@@ -1769,23 +1775,17 @@ static EG_KING_TABLE: [i32; 64] = [
 static GAMEPHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0]; // pawn, knight, bishop, rook, queen, king
 
 impl Engine {
-    fn hanging_penalty(&self, color: Color) -> i32 {
+    fn hanging_penalty(
+        &self,
+        enemy_attacks: BitBoard,
+        friendly_attacks: BitBoard,
+        mut our_pieces: BitBoard,
+    ) -> i32 {
         let bc = &self.game.board_collection;
-        let enemy_attacks = bc.attacks_by(!color);
-        let friendly_attacks = bc.attacks_by(color);
 
         let mut penalty = 0;
-        let mut our_pieces = bc.occupied_color(color);
 
         while let Some(sq) = our_pieces.pop_lsb() {
-            if bc.piece_at_index(sq) == None {
-                println!("{}", bc.occupied_color(color));
-                println!("{:?}", bc.mailbox);
-                println!("{}", sq);
-
-                panic!()
-            }
-
             let piece = bc.piece_at_index(sq).unwrap();
             if piece.kind == PieceKind::King {
                 continue;
@@ -1798,10 +1798,36 @@ impl Engine {
         penalty
     }
 
+    fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard) -> i32 {
+        let mut around = BitBoard(0);
+        let (file, rank) = BC::decode_tile(king_sq);
+        for (df, dr) in KING_DIRECTIONS {
+            let (nf, nr) = (file as i8 + df, rank as i8 + dr);
+            if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                around.0 |= 1 << BC::encode_tile(nf as u8, nr as u8);
+            }
+        }
+
+        (around & friendly_pieces).0.count_ones() as i32 * 10
+    }
+
     fn static_eval(&self) -> i32 {
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let bc = &self.game.board_collection;
+        let friendly_attacks = bc.attacks_by(color);
+        let enemy_attacks = bc.attacks_by(!color);
+        let friendly_pieces = bc.occupied_color(color);
+        let enemy_pieces = bc.occupied_color(!color);
+
         let mut mg = [0; 2];
         let mut eg = [0; 2];
         let mut game_phase = 0i32;
+        let mut white_king_sq = 0;
+        let mut black_king_sq = 0;
 
         for sq in 0..64u8 {
             if let Some(piece) = self.game.board_collection.piece_at_index(sq) {
@@ -1832,6 +1858,14 @@ impl Engine {
                     PieceKind::King => 0,
                 };
 
+                if piece.kind == PieceKind::King {
+                    if piece.color == Color::White {
+                        white_king_sq = sq;
+                    } else {
+                        black_king_sq = sq;
+                    }
+                }
+
                 mg[color_idx] += mg_val + material;
                 eg[color_idx] += eg_val + material;
                 game_phase += GAMEPHASE_INC[piece.kind as usize];
@@ -1846,14 +1880,26 @@ impl Engine {
         let mg_phase = game_phase.min(24);
         let eg_phase = 24 - mg_phase;
 
-        let side = if self.game.white_turn {
-            Color::White
-        } else {
-            Color::Black
-        };
-        let hanging = self.hanging_penalty(side) - self.hanging_penalty(!side);
+        let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
+            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
 
-        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
+        let king_sq = if self.game.white_turn {
+            white_king_sq
+        } else {
+            black_king_sq
+        };
+        let enemy_king_sq = if self.game.white_turn {
+            black_king_sq
+        } else {
+            white_king_sq
+        };
+
+        let king_safety = (self.king_safety(king_sq, friendly_pieces)
+            - self.king_safety(enemy_king_sq, enemy_pieces))
+            * mg_phase
+            / 24;
+
+        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + king_safety
     }
 
     fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
@@ -1915,15 +1961,25 @@ impl Engine {
             let pseudo = move_gen.pseudo_legal_moves(color);
             pseudo
         };
-
+        let hash = self.game.hash;
         let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
 
-        moves.sort_by(|a, b| {
-            let a_cap = a.flags.contains(MoveFlags::CAPTURE);
-            let b_cap = b.flags.contains(MoveFlags::CAPTURE);
+        let tt_idx = (hash as usize) & (self.tt.len() - 1);
+        if let Some(entry) = self.tt[tt_idx] {
+            if entry.hash == hash {
+                if let Some(tt_move) = entry.best_move {
+                    if let Some(pos) = moves
+                        .iter()
+                        .position(|m| m.from == tt_move.from && m.to == tt_move.to)
+                    {
+                        moves.swap(0, pos);
+                    }
+                }
+            }
+        }
 
-            b_cap.cmp(&a_cap)
-        });
+        // sort the rest
+        moves[1..].sort_by_key(|m| -self.move_score(m));
 
         for mv in moves.iter() {
             if start.elapsed().as_millis() as u64 >= deadline {
@@ -1968,13 +2024,18 @@ impl Engine {
             return 0;
         }
 
+        if self.game.fifty_move_rule >= 100 {
+            return 0;
+        }
+
         self.nodes += 1;
         let hash = self.game.hash;
         let search_count = self.history.get(&hash).copied().unwrap_or(0);
         let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
 
-        if search_count >= 2 || game_count >= 3 {
-            return 0;
+        if search_count >= 2 || game_count >= 2 {
+            let eval = self.static_eval();
+            return if eval > 0 { -50 } else { 50 };
         }
 
         let original_alpha = alpha;
@@ -2005,18 +2066,11 @@ impl Engine {
         // Null move pruning
         if !in_check && depth >= 3 {
             // If has any piece other than pawns
-            let mut pieces = self.game.board_collection.occupied_color(color);
-            let mut has_non_pawns = false;
-
-            while let Some(idx) = pieces.pop_lsb() {
-                let kind = self.game.board_collection.mailbox[idx as usize]
-                    .unwrap()
-                    .kind;
-                if ![PieceKind::King, PieceKind::Pawn].contains(&kind) {
-                    has_non_pawns = true;
-                    break;
-                }
-            }
+            let bc = self.game.board_collection;
+            let mut has_non_pawns = (bc.occupied_color(color).0
+                & !(bc.get_board(&color.kind(PieceKind::Pawn)).0
+                    | bc.get_board(&color.kind(PieceKind::King)).0))
+                != 0;
 
             if has_non_pawns {
                 let prev_hash = self.game.hash;
@@ -2057,7 +2111,23 @@ impl Engine {
             }
             return 0;
         }
-        moves.sort_by_key(|m| -self.capture_score(m));
+
+        let tt_idx = (hash as usize) & (self.tt.len() - 1);
+        if let Some(entry) = self.tt[tt_idx] {
+            if entry.hash == hash {
+                if let Some(tt_move) = entry.best_move {
+                    if let Some(pos) = moves
+                        .iter()
+                        .position(|m| m.from == tt_move.from && m.to == tt_move.to)
+                    {
+                        moves.swap(0, pos);
+                    }
+                }
+            }
+        }
+
+        // sort the rest
+        moves[1..].sort_by_key(|m| -self.move_score(m));
 
         *self.history.entry(hash).or_insert(0) += 1;
         let mut best_move = None;
@@ -2134,12 +2204,22 @@ impl Engine {
         alpha
     }
 
+    fn move_score(&self, m: &Move) -> i32 {
+        if m.flags.contains(MoveFlags::CAPTURE) {
+            return 10000 + self.capture_score(m);
+        }
+        if m.flags.intersects(MoveFlags::PROMOTE_Q) {
+            return 9000;
+        }
+        0
+    }
+
     fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
         let hash = self.game.hash;
         let search_count = self.history.get(&hash).copied().unwrap_or(0);
         let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
 
-        if search_count >= 2 || game_count >= 2 {
+        if search_count >= 1 || game_count >= 2 {
             return 0;
         }
 
@@ -2268,6 +2348,10 @@ fn main() {
             println!("readyok");
         }
 
+        if input == "stop" {
+            engine.stop = true;
+        }
+
         if input == "ucinewgame" {
             engine = Engine {
                 game: Game::from_fen(START_POS),
@@ -2297,6 +2381,7 @@ fn main() {
         }
 
         if input.starts_with("go") {
+            engine.stop = false;
             let parts = input.split_whitespace().collect::<Vec<&str>>();
             let depth = if parts.len() > 2 && parts[1] == "depth" {
                 parts[2].parse::<u8>().unwrap_or(4)
