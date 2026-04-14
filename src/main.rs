@@ -232,9 +232,7 @@ impl Display for BitBoard {
 struct BitBoardCollection {
     // 6 pieces, 2 colours
     piece_boards: [[BitBoard; 6]; 2],
-    attacks: [[BitBoard; 6]; 2],
     mailbox: [Option<ChessPiece>; 64],
-    attacks_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -257,10 +255,28 @@ impl BitBoardCollection {
     fn new() -> Self {
         Self {
             piece_boards: [[BitBoard(0); 6]; 2],
-            attacks: [[BitBoard(0); 6]; 2],
-            attacks_dirty: true,
+
             mailbox: [None; 64],
         }
+    }
+
+    fn compute_control(&self, color: Color) -> [[i32; 64]; 6] {
+        let mut control = [[0i32; 64]; 6];
+
+        for kind in 0..6usize {
+            let piece = color.kind(kind.try_into().unwrap());
+
+            let mut bb = *self.get_board(&piece);
+
+            while let Some(idx) = bb.pop_lsb() {
+                let mut piece_attakcs = self.piece_attacks(idx, piece);
+                while let Some(sq) = piece_attakcs.pop_lsb() {
+                    control[kind][sq as usize] += 1;
+                }
+            }
+        }
+
+        control
     }
 
     fn attacks_by(&self, color: Color) -> BitBoard {
@@ -485,7 +501,7 @@ impl BitBoardCollection {
             PieceKind::Knight => self.knight_attacks(index),
             PieceKind::Bishop => self.bishop_attacks(index),
             PieceKind::Rook => self.rook_attacks(index),
-            PieceKind::Queen => BitBoard(self.bishop_attacks(index).0 | self.rook_attacks(index).0),
+            PieceKind::Queen => self.bishop_attacks(index) | self.rook_attacks(index),
             PieceKind::King => self.king_attacks(index),
         }
     }
@@ -806,6 +822,27 @@ impl<'a> MoveGen<'a> {
         mg
     }
 
+    fn new_engine(engine: &'a Engine) -> Self {
+        let game = &engine.game;
+        let mut mg = Self {
+            game,
+            bc: &game.board_collection,
+            white_attacks: BitBoard(0),
+            black_attacks: BitBoard(0),
+            white_occ: BitBoard(0),
+            black_occ: BitBoard(0),
+            occupied: BitBoard(0),
+        };
+
+        mg.white_attacks = engine.cached_attacks[0];
+        mg.black_attacks = engine.cached_attacks[1];
+        mg.white_occ = game.board_collection.occupied_color(Color::White);
+        mg.black_occ = game.board_collection.occupied_color(Color::Black);
+        mg.occupied = mg.white_occ | mg.black_occ;
+
+        mg
+    }
+
     fn filter_legal(pseudo_moves: Vec<Move>, game: &mut Game, color: Color) -> Vec<Move> {
         let check_info = game.board_collection.check_info(color);
         let pin_info = game.board_collection.pin_info(color);
@@ -870,10 +907,6 @@ impl<'a> MoveGen<'a> {
         }
 
         moves
-    }
-
-    fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
-        self.game.board_collection.piece_attacks(index, piece)
     }
 
     fn piece_captures(&self, index: u8, piece: ChessPiece) -> BitBoard {
@@ -1695,9 +1728,12 @@ struct Engine {
     history: HashMap<u64, u8>,
     tt: Vec<Option<TTEntry>>,
     nodes: u64,
-    game_history: HashMap<u64, u8>,
+    game_history: HashMap<u64, u8>, // Order doesnt matter, can appear multiple times
     last_score: i32,
     stop: bool,
+    cached_attacks: [BitBoard; 2],
+    cached_control: [[[i32; 64]; 6]; 2],
+    cache_hash: u64,
 }
 
 // Values from PeSTO
@@ -1779,7 +1815,77 @@ static EG_KING_TABLE: [i32; 64] = [
 static GAMEPHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0]; // pawn, knight, bishop, rook, queen, king
 static PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 10, 20, 35, 55, 80, 120];
 
+static CENTER_BONUS: [i32; 64] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 2, 2, 2, 2, 1, 0, 0, 1, 2, 3, 3, 2, 1, 0,
+    0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 2, 2, 2, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+static CONTROL_WEIGHTS: [i32; 6] = [
+    3, // pawn control is very valuable
+    2, // knight
+    2, // bishop
+    1, // rook
+    1, // queen
+    0, // king
+];
+
+static ATTACK_WEIGHTS: [i32; 6] = [0, 2, 2, 3, 5, 0]; // pawn, knight, bishop, rook, queen, king
+
+static SAFETY_TABLE: [i32; 100] = {
+    let mut table = [0i32; 100];
+    let mut i = 0;
+    while i < 100 {
+        table[i] = (i * i) as i32 / 10;
+        i += 1;
+    }
+    table
+};
+
 impl Engine {
+    fn new() -> Self {
+        Engine {
+            game: Game::from_fen(START_POS),
+            history: HashMap::new(),
+            game_history: HashMap::new(),
+            tt: vec![None; 1 << 22],
+            last_score: 0,
+            stop: false,
+            nodes: 0,
+            cache_hash: 0,
+            cached_attacks: [BitBoard(0); 2],
+            cached_control: [[[0; 64]; 6]; 2],
+        }
+    }
+
+    fn refresh_cache(&mut self) {
+        if self.cache_hash == self.game.hash {
+            return; // Nothing to do
+        }
+
+        let bc = &self.game.board_collection;
+
+        for c in 0..2usize {
+            let color = Color::try_from(c).unwrap();
+            let mut attacks = BitBoard(0);
+            let mut control = [[0i32; 64]; 6];
+            for kind in 0..6usize {
+                let piece = color.kind(kind.try_into().unwrap());
+                let mut bb = *bc.get_board(&piece);
+
+                while let Some(idx) = bb.pop_lsb() {
+                    let mut piece_attack = bc.piece_attacks(idx, piece);
+                    attacks.0 |= piece_attack.0;
+                    while let Some(sq) = piece_attack.pop_lsb() {
+                        control[kind][sq as usize] += 1;
+                    }
+                }
+            }
+            self.cached_attacks[c] = attacks;
+            self.cached_control[c] = control;
+        }
+
+        self.cache_hash = self.game.hash;
+    }
     fn hanging_penalty(
         &self,
         enemy_attacks: BitBoard,
@@ -1803,8 +1909,11 @@ impl Engine {
         penalty
     }
 
-    fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard) -> i32 {
+    fn king_safety(&self, king_sq: u8, color: Color, friendly_pieces: BitBoard, mg: i32) -> i32 {
+        let mg_fac = mg as f32 / 24f32;
         let mut around = BitBoard(0);
+        around.insert(king_sq);
+
         let (file, rank) = BC::decode_tile(king_sq);
         for (df, dr) in KING_DIRECTIONS {
             let (nf, nr) = (file as i8 + df, rank as i8 + dr);
@@ -1813,7 +1922,31 @@ impl Engine {
             }
         }
 
-        (around & friendly_pieces).0.count_ones() as i32 * 10
+        let friendlies = (around & friendly_pieces).0.count_ones() as i32 * 10;
+        let mut attack_weight = 0;
+        let mut attack_count = 0;
+
+        let enemy_control = self.cached_control[(!color) as usize];
+
+        for kind in 0..6usize {
+            for sq in 0..64usize {
+                if (around & BitBoard(1 << sq)).is_empty() {
+                    continue;
+                }
+                let count = enemy_control[kind][sq as usize];
+                if count > 0 {
+                    attack_count += 1;
+                    attack_weight += ATTACK_WEIGHTS[kind] * count;
+                }
+            }
+        }
+        let danger = if attack_count < 2 {
+            0
+        } else {
+            SAFETY_TABLE[attack_weight.min(99) as usize]
+        };
+
+        (((danger - friendlies) as f32 * mg_fac) as i32).clamp(-300, 300)
     }
 
     fn pawn_bonus(&self, friendly_pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
@@ -1867,15 +2000,19 @@ impl Engine {
         bonus
     }
 
-    fn static_eval(&self) -> i32 {
+    fn static_eval(&mut self) -> i32 {
+        self.refresh_cache();
+
         let color = if self.game.white_turn {
             Color::White
         } else {
             Color::Black
         };
         let bc = &self.game.board_collection;
-        let friendly_attacks = bc.attacks_by(color);
-        let enemy_attacks = bc.attacks_by(!color);
+        let friendly_attacks = self.cached_attacks[color as usize];
+        let enemy_attacks = self.cached_attacks[(!color) as usize];
+        let friendly_control = self.cached_control[color as usize];
+        let enemy_control = self.cached_control[(!color) as usize];
         let friendly_pieces = bc.occupied_color(color);
         let enemy_pieces = bc.occupied_color(!color);
 
@@ -1947,8 +2084,8 @@ impl Engine {
         let mg_phase = game_phase.min(24);
         let eg_phase = 24 - mg_phase;
 
-        let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
-            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
+        let hanging = (self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
+            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces));
 
         let king_sq = if self.game.white_turn {
             white_king_sq
@@ -1961,10 +2098,8 @@ impl Engine {
             white_king_sq
         };
 
-        let king_safety = (self.king_safety(king_sq, friendly_pieces)
-            - self.king_safety(enemy_king_sq, enemy_pieces))
-            * mg_phase
-            / 24;
+        let king_safety = self.king_safety(king_sq, color, friendly_pieces, mg_phase)
+            - self.king_safety(enemy_king_sq, !color, enemy_pieces, mg_phase);
 
         let friendly_pawns = *self
             .game
@@ -1992,12 +2127,30 @@ impl Engine {
         };
 
         let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
-        let control =
-            (friendly_attacks.0.count_ones() as i32 - enemy_attacks.0.count_ones() as i32) * 2;
 
-        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + king_safety + pawns
+        let control_bonus = self.control_bonus(friendly_control, enemy_control);
+
+        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
+            + king_safety
+            + pawns
+            + control_bonus
+            + bishops
     }
+    fn control_bonus(
+        &self,
+        friendly_control: [[i32; 64]; 6],
+        enemy_control: [[i32; 64]; 6],
+    ) -> i32 {
+        let mut control_bonus = 0;
+        for kind in 0..6usize {
+            for sq in 0..64usize {
+                let weight = CONTROL_WEIGHTS[kind] * CENTER_BONUS[sq];
+                control_bonus += (friendly_control[kind][sq] - enemy_control[kind][sq]) * weight;
+            }
+        }
 
+        control_bonus
+    }
     fn bishop_bonus(&self, bishop_count: u8) -> i32 {
         if bishop_count < 2 { 0 } else { 30 }
     }
@@ -2045,8 +2198,10 @@ impl Engine {
     }
 
     fn search_at_depth(&mut self, depth: u8, start: &Instant, deadline: u64) -> Option<Move> {
-        let mut alpha = -i32::MAX;
-        let mut beta = i32::MAX;
+        self.refresh_cache();
+
+        let mut alpha = -999_999_999;
+        let mut beta = 999_999_999;
         let mut best_move = None;
 
         let color = if self.game.white_turn {
@@ -2056,7 +2211,7 @@ impl Engine {
         };
 
         let moves = {
-            let move_gen = MoveGen::new(&self.game);
+            let move_gen = MoveGen::new_engine(&self);
             let pseudo = move_gen.pseudo_legal_moves(color);
             pseudo
         };
@@ -2090,7 +2245,7 @@ impl Engine {
             let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline);
             let mut mv_s = BC::encode_notation(mv.from);
             mv_s.extend(BC::encode_notation(mv.to).chars());
-            // println!("{}", mv_s);
+
             // self.debug_eval();
             // println!();
             self.game.undo_move(&undo);
@@ -2113,6 +2268,7 @@ impl Engine {
         start: &Instant,
         deadline: u64,
     ) -> i32 {
+        self.refresh_cache();
         if self.nodes & 2047 == 0 {
             if start.elapsed().as_millis() as u64 >= deadline {
                 self.stop = true;
@@ -2131,6 +2287,12 @@ impl Engine {
         let hash = self.game.hash;
         let search_count = self.history.get(&hash).copied().unwrap_or(0);
         let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
+
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
 
         if search_count >= 2 || game_count >= 2 {
             let eval = self.static_eval();
@@ -2166,7 +2328,7 @@ impl Engine {
         if !in_check && depth >= 3 {
             // If has any piece other than pawns
             let bc = self.game.board_collection;
-            let mut has_non_pawns = (bc.occupied_color(color).0
+            let has_non_pawns = (bc.occupied_color(color).0
                 & !(bc.get_board(&color.kind(PieceKind::Pawn)).0
                     | bc.get_board(&color.kind(PieceKind::King)).0))
                 != 0;
@@ -2188,6 +2350,7 @@ impl Engine {
                 self.game.white_turn = !self.game.white_turn;
                 self.game.en_passant_square = prev_ep;
                 self.game.hash = prev_hash;
+                self.cache_hash = 0; // force cache refresh
 
                 // Position so good, that oponent wouldnt let us reach it
                 if score >= beta {
@@ -2196,8 +2359,9 @@ impl Engine {
             }
         }
 
+        self.refresh_cache();
         let moves = {
-            let move_gen = MoveGen::new(&self.game);
+            let move_gen = MoveGen::new_engine(&self);
             let pseudo = move_gen.pseudo_legal_moves(color);
             pseudo
         };
@@ -2322,6 +2486,14 @@ impl Engine {
             return 0;
         }
 
+        self.refresh_cache();
+
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+
         let stand_pat = self.static_eval();
 
         if stand_pat >= beta {
@@ -2331,13 +2503,8 @@ impl Engine {
             alpha = stand_pat;
         }
 
-        let color = if self.game.white_turn {
-            Color::White
-        } else {
-            Color::Black
-        };
-
-        let moves = MoveGen::new(&self.game)
+        let move_gen = MoveGen::new_engine(&self);
+        let moves = move_gen
             .pseudo_legal_moves(color)
             .into_iter()
             .filter(|m| m.flags.contains(MoveFlags::CAPTURE))
@@ -2388,9 +2555,18 @@ impl Engine {
         capture as i32 - attacker as i32
     }
 
-    fn debug_eval(&self) {
+    fn debug_eval(&mut self) {
         // println!("{}", self.game.board_collection);
-        println!("Static eval: {}", self.static_eval());
+        let move_gen = MoveGen::new_engine(&self);
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        self.refresh_cache();
+        let eval = self.static_eval();
+
+        println!("Static eval: {}", eval);
         println!("White material: {}", self.material_score(Color::White));
         println!("Black material: {}", self.material_score(Color::Black));
         println!("Hash: {}", self.game.hash);
@@ -2424,15 +2600,7 @@ fn take_input() -> String {
 
 const START_POS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 fn main() {
-    let mut engine = Engine {
-        game: Game::from_fen(START_POS),
-        history: HashMap::new(),
-        game_history: HashMap::new(),
-        tt: vec![None; 1 << 22],
-        last_score: 0,
-        stop: false,
-        nodes: 0,
-    };
+    let mut engine = Engine::new();
 
     loop {
         let input = take_input();
@@ -2455,15 +2623,7 @@ fn main() {
         }
 
         if input == "ucinewgame" {
-            engine = Engine {
-                game: Game::from_fen(START_POS),
-                history: HashMap::new(),
-                game_history: HashMap::new(),
-                tt: vec![None; 1 << 22],
-                stop: false,
-                last_score: 0,
-                nodes: 0,
-            };
+            engine = Engine::new();
         }
 
         if input == "eval" {
