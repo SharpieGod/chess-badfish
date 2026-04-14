@@ -1917,7 +1917,7 @@ impl Engine {
         self.cached_weighted_control[color] - self.cached_weighted_control[1 - color]
     }
 
-    fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard) -> i32 {
+    fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard, enemy_attacks: BitBoard) -> i32 {
         let mut around = BitBoard(0);
         let (file, rank) = BC::decode_tile(king_sq);
         for (df, dr) in KING_DIRECTIONS {
@@ -1927,9 +1927,11 @@ impl Engine {
             }
         }
 
-        (around & friendly_pieces).0.count_ones() as i32 * 10
-    }
+        let safe_defenders = (around & friendly_pieces & !enemy_attacks).0.count_ones() as i32;
+        let attacked_empty = (around & !friendly_pieces & enemy_attacks).0.count_ones() as i32;
 
+        safe_defenders * 10 - attacked_empty * 10
+    }
     fn static_eval(&self) -> i32 {
         let color = if self.game.white_turn {
             Color::White
@@ -2024,15 +2026,94 @@ impl Engine {
             white_king_sq
         };
 
+        let friendly_pawns = *self
+            .game
+            .board_collection
+            .get_board(&color.kind(PieceKind::Pawn));
+
+        let enemy_pawns = *self
+            .game
+            .board_collection
+            .get_board(&(!color).kind(PieceKind::Pawn));
+
+        let pawns = self.pawn_bonus(friendly_pawns, enemy_pawns, color)
+            - self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
+
         let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
 
         let control = self.control_bonus();
-        let king_safety = (self.king_safety(king_sq, friendly_pieces)
-            - self.king_safety(enemy_king_sq, enemy_pieces))
+        let king_safety = (self.king_safety(king_sq, friendly_pieces, enemy_attacks)
+            - self.king_safety(enemy_king_sq, enemy_pieces, friendly_attacks))
             * mg_phase
             / 24;
 
-        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + control + king_safety + bishops
+        let castling_rights_bonus = {
+            let our_rights = if self.game.white_turn {
+                self.game.k_white as i32 + self.game.q_white as i32
+            } else {
+                self.game.k_black as i32 + self.game.q_black as i32
+            };
+            let their_rights = if self.game.white_turn {
+                self.game.k_black as i32 + self.game.q_black as i32
+            } else {
+                self.game.k_white as i32 + self.game.q_white as i32
+            };
+            (our_rights - their_rights) * 20
+        };
+
+        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
+            + control
+            + king_safety
+            + bishops
+            + castling_rights_bonus
+            + pawns
+    }
+
+    fn pawn_bonus(&self, friendly_pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
+        // Passed pawns detection
+        let doubled_pawns_penalty = 20;
+        let file_mask = 0x0101010101010101;
+        let mut bonus = 0;
+
+        let mut friendly_pawns_clone = friendly_pawns;
+        while let Some(pawn_sq) = friendly_pawns_clone.pop_lsb() {
+            let (file, rank) = BC::decode_tile(pawn_sq);
+            let mut scan_mask = file_mask << file;
+            if file > 0 {
+                scan_mask |= file_mask << (file - 1);
+            }
+            if file < 7 {
+                scan_mask |= file_mask << (file + 1);
+            }
+            // Dont look behind pawn
+            if color == Color::White {
+                scan_mask &= !0u64 << (rank * 8); // mask out squares below
+            } else {
+                scan_mask &= !(!0u64 << (rank * 8)); // mask out squares above
+            }
+
+            scan_mask &= enemy_pawns.0;
+
+            // println!("{} {:?}", BitBoard(scan_mask), color);
+            if scan_mask == 0 {
+                let bonus_rank = if color == Color::White {
+                    rank
+                } else {
+                    7 - rank
+                };
+
+                bonus += PASSED_PAWN_BONUS[bonus_rank as usize];
+            }
+        }
+
+        for file in 0..8 {
+            let pawns_on_file = (file_mask << file & friendly_pawns.0).count_ones();
+            if pawns_on_file > 1 {
+                bonus -= doubled_pawns_penalty * (pawns_on_file - 1) as i32;
+            }
+        }
+
+        bonus
     }
 
     fn bishop_bonus(&self, bishop_count: u8) -> i32 {
