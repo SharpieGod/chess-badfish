@@ -2211,7 +2211,7 @@ impl Engine {
         };
 
         let moves = {
-            let move_gen = MoveGen::new_engine(&self);
+            let move_gen = MoveGen::new(&self.game);
             let pseudo = move_gen.pseudo_legal_moves(color);
             pseudo
         };
@@ -2268,7 +2268,6 @@ impl Engine {
         start: &Instant,
         deadline: u64,
     ) -> i32 {
-        self.refresh_cache();
         if self.nodes & 2047 == 0 {
             if start.elapsed().as_millis() as u64 >= deadline {
                 self.stop = true;
@@ -2359,9 +2358,9 @@ impl Engine {
             }
         }
 
-        self.refresh_cache();
         let moves = {
-            let move_gen = MoveGen::new_engine(&self);
+            let move_gen = MoveGen::new(&self.game);
+
             let pseudo = move_gen.pseudo_legal_moves(color);
             pseudo
         };
@@ -2370,7 +2369,7 @@ impl Engine {
 
         if moves.is_empty() {
             if in_check {
-                return -(1000000 - depth as i32);
+                return -(1900000 - depth as i32);
             }
             return 0;
         }
@@ -2486,8 +2485,6 @@ impl Engine {
             return 0;
         }
 
-        self.refresh_cache();
-
         let color = if self.game.white_turn {
             Color::White
         } else {
@@ -2503,7 +2500,7 @@ impl Engine {
             alpha = stand_pat;
         }
 
-        let move_gen = MoveGen::new_engine(&self);
+        let move_gen = MoveGen::new(&self.game);
         let moves = move_gen
             .pseudo_legal_moves(color)
             .into_iter()
