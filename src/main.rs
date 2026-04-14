@@ -1732,7 +1732,7 @@ struct Engine {
     last_score: i32,
     stop: bool,
     cached_attacks: [BitBoard; 2],
-    cached_control: [[[i32; 64]; 6]; 2],
+    cached_weighted_control: [i32; 2],
     cache_hash: u64,
 }
 
@@ -1853,7 +1853,7 @@ impl Engine {
             nodes: 0,
             cache_hash: 0,
             cached_attacks: [BitBoard(0); 2],
-            cached_control: [[[0; 64]; 6]; 2],
+            cached_weighted_control: [0; 2],
         }
     }
 
@@ -1867,25 +1867,28 @@ impl Engine {
         for c in 0..2usize {
             let color = Color::try_from(c).unwrap();
             let mut attacks = BitBoard(0);
-            let mut control = [[0i32; 64]; 6];
+
+            let mut weighted_control = 0;
             for kind in 0..6usize {
                 let piece = color.kind(kind.try_into().unwrap());
                 let mut bb = *bc.get_board(&piece);
-
                 while let Some(idx) = bb.pop_lsb() {
                     let mut piece_attack = bc.piece_attacks(idx, piece);
                     attacks.0 |= piece_attack.0;
-                    while let Some(sq) = piece_attack.pop_lsb() {
-                        control[kind][sq as usize] += 1;
+                    if kind < 5 {
+                        while let Some(sq) = piece_attack.pop_lsb() {
+                            weighted_control += CONTROL_WEIGHTS[kind] * CENTER_BONUS[sq as usize];
+                        }
                     }
                 }
             }
+            self.cached_weighted_control[c] = weighted_control;
             self.cached_attacks[c] = attacks;
-            self.cached_control[c] = control;
         }
 
         self.cache_hash = self.game.hash;
     }
+
     fn hanging_penalty(
         &self,
         enemy_attacks: BitBoard,
@@ -1909,11 +1912,13 @@ impl Engine {
         penalty
     }
 
-    fn king_safety(&self, king_sq: u8, color: Color, friendly_pieces: BitBoard, mg: i32) -> i32 {
-        let mg_fac = mg as f32 / 24f32;
-        let mut around = BitBoard(0);
-        around.insert(king_sq);
+    fn control_bonus(&self) -> i32 {
+        let color = if self.game.white_turn { 0 } else { 1 };
+        self.cached_weighted_control[color] - self.cached_weighted_control[1 - color]
+    }
 
+    fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard) -> i32 {
+        let mut around = BitBoard(0);
         let (file, rank) = BC::decode_tile(king_sq);
         for (df, dr) in KING_DIRECTIONS {
             let (nf, nr) = (file as i8 + df, rank as i8 + dr);
@@ -1922,87 +1927,10 @@ impl Engine {
             }
         }
 
-        let friendlies = (around & friendly_pieces).0.count_ones() as i32 * 10;
-        let mut attack_weight = 0;
-        let mut attack_count = 0;
-
-        let enemy_control = self.cached_control[(!color) as usize];
-
-        for kind in 0..6usize {
-            for sq in 0..64usize {
-                if (around & BitBoard(1 << sq)).is_empty() {
-                    continue;
-                }
-                let count = enemy_control[kind][sq as usize];
-                if count > 0 {
-                    attack_count += 1;
-                    attack_weight += ATTACK_WEIGHTS[kind] * count;
-                }
-            }
-        }
-        let danger = if attack_count < 2 {
-            0
-        } else {
-            SAFETY_TABLE[attack_weight.min(99) as usize]
-        };
-
-        (((danger - friendlies) as f32 * mg_fac) as i32).clamp(-300, 300)
+        (around & friendly_pieces).0.count_ones() as i32 * 10
     }
 
-    fn pawn_bonus(&self, friendly_pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
-        // Passed pawns detection
-        let doubled_pawns_penalty = 20;
-        let file_mask = 0x0101010101010101;
-        let mut bonus = 0;
-
-        let mut friendly_pawns_clone = friendly_pawns;
-        while let Some(pawn_sq) = friendly_pawns_clone.pop_lsb() {
-            let (file, rank) = BC::decode_tile(pawn_sq);
-            let mut scan_mask = file_mask << file;
-            if file > 0 {
-                scan_mask |= file_mask << (file - 1);
-            }
-            if file < 7 {
-                scan_mask |= file_mask << (file + 1);
-            }
-            // Dont look behind pawn
-            if color == Color::White {
-                scan_mask &= !0u64 << (rank * 8); // mask out squares below
-            } else {
-                scan_mask &= !(!0u64 << (rank * 8)); // mask out squares above
-            }
-
-            scan_mask &= enemy_pawns.0;
-
-            // println!("{} {:?}", BitBoard(scan_mask), color);
-            if scan_mask == 0 {
-                let bonus_rank = if color == Color::White {
-                    rank
-                } else {
-                    7 - rank
-                } + 1;
-
-                bonus += PASSED_PAWN_BONUS[bonus_rank as usize];
-                // eprintln!(
-                //     "{} {:?} {}",
-                //     rank, color, PASSED_PAWN_BONUS[bonus_rank as usize]
-                // );
-            }
-        }
-
-        for file in 0..8 {
-            let pawns_on_file = (file_mask << file & friendly_pawns.0).count_ones();
-            if pawns_on_file > 1 {
-                bonus -= doubled_pawns_penalty * (pawns_on_file - 1) as i32;
-            }
-        }
-
-        bonus
-    }
-
-    fn static_eval(&mut self) -> i32 {
-        self.refresh_cache();
-
+    fn static_eval(&self) -> i32 {
         let color = if self.game.white_turn {
             Color::White
         } else {
@@ -2011,8 +1939,7 @@ impl Engine {
         let bc = &self.game.board_collection;
         let friendly_attacks = self.cached_attacks[color as usize];
         let enemy_attacks = self.cached_attacks[(!color) as usize];
-        let friendly_control = self.cached_control[color as usize];
-        let enemy_control = self.cached_control[(!color) as usize];
+
         let friendly_pieces = bc.occupied_color(color);
         let enemy_pieces = bc.occupied_color(!color);
 
@@ -2022,8 +1949,8 @@ impl Engine {
         let mut white_king_sq = 0;
         let mut black_king_sq = 0;
 
-        let mut white_bishops = 0;
-        let mut black_bishops = 0;
+        let mut friendly_bishops = 0;
+        let mut enemy_bishops = 0;
 
         for sq in 0..64u8 {
             if let Some(piece) = self.game.board_collection.piece_at_index(sq) {
@@ -2063,13 +1990,12 @@ impl Engine {
                 }
 
                 if piece.kind == PieceKind::Bishop {
-                    if piece.color == Color::White {
-                        white_bishops += 1;
+                    if piece.color == color {
+                        friendly_bishops += 1;
                     } else {
-                        black_bishops += 1;
+                        enemy_bishops += 1;
                     }
                 }
-
                 mg[color_idx] += mg_val + material;
                 eg[color_idx] += eg_val + material;
                 game_phase += GAMEPHASE_INC[piece.kind as usize];
@@ -2084,8 +2010,8 @@ impl Engine {
         let mg_phase = game_phase.min(24);
         let eg_phase = 24 - mg_phase;
 
-        let hanging = (self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
-            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces));
+        let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
+            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
 
         let king_sq = if self.game.white_turn {
             white_king_sq
@@ -2098,62 +2024,21 @@ impl Engine {
             white_king_sq
         };
 
-        let king_safety = self.king_safety(king_sq, color, friendly_pieces, mg_phase)
-            - self.king_safety(enemy_king_sq, !color, enemy_pieces, mg_phase);
-
-        let friendly_pawns = *self
-            .game
-            .board_collection
-            .get_board(&color.kind(PieceKind::Pawn));
-
-        let enemy_pawns = *self
-            .game
-            .board_collection
-            .get_board(&(!color).kind(PieceKind::Pawn));
-
-        let pawns = self.pawn_bonus(friendly_pawns, enemy_pawns, color)
-            - self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
-
-        let friendly_bishops = if self.game.white_turn {
-            white_bishops
-        } else {
-            black_bishops
-        };
-
-        let enemy_bishops = if self.game.white_turn {
-            black_bishops
-        } else {
-            white_bishops
-        };
-
         let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
 
-        let control_bonus = self.control_bonus(friendly_control, enemy_control);
+        let control = self.control_bonus();
+        let king_safety = (self.king_safety(king_sq, friendly_pieces)
+            - self.king_safety(enemy_king_sq, enemy_pieces))
+            * mg_phase
+            / 24;
 
-        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
-            + king_safety
-            + pawns
-            + control_bonus
-            + bishops
+        (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging + control + king_safety + bishops
     }
-    fn control_bonus(
-        &self,
-        friendly_control: [[i32; 64]; 6],
-        enemy_control: [[i32; 64]; 6],
-    ) -> i32 {
-        let mut control_bonus = 0;
-        for kind in 0..6usize {
-            for sq in 0..64usize {
-                let weight = CONTROL_WEIGHTS[kind] * CENTER_BONUS[sq];
-                control_bonus += (friendly_control[kind][sq] - enemy_control[kind][sq]) * weight;
-            }
-        }
 
-        control_bonus
-    }
     fn bishop_bonus(&self, bishop_count: u8) -> i32 {
         if bishop_count < 2 { 0 } else { 30 }
     }
+
     fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
         self.tt.iter_mut().for_each(|e| *e = None);
         let start = Instant::now();
@@ -2198,8 +2083,6 @@ impl Engine {
     }
 
     fn search_at_depth(&mut self, depth: u8, start: &Instant, deadline: u64) -> Option<Move> {
-        self.refresh_cache();
-
         let mut alpha = -999_999_999;
         let mut beta = 999_999_999;
         let mut best_move = None;
@@ -2294,6 +2177,7 @@ impl Engine {
         };
 
         if search_count >= 2 || game_count >= 2 {
+            self.refresh_cache();
             let eval = self.static_eval();
             return if eval > 0 { -50 } else { 50 };
         }
@@ -2491,6 +2375,7 @@ impl Engine {
             Color::Black
         };
 
+        self.refresh_cache();
         let stand_pat = self.static_eval();
 
         if stand_pat >= beta {
@@ -2560,6 +2445,7 @@ impl Engine {
         } else {
             Color::Black
         };
+
         self.refresh_cache();
         let eval = self.static_eval();
 
