@@ -1841,6 +1841,9 @@ static SAFETY_TABLE: [i32; 100] = {
     table
 };
 
+static MG_PIECE_VALUES: [i32; 6] = [82, 337, 365, 477, 1025, 0]; // P N B R Q K
+static EG_PIECE_VALUES: [i32; 6] = [94, 281, 297, 512, 936, 0];
+
 impl Engine {
     fn new() -> Self {
         Engine {
@@ -1904,8 +1907,26 @@ impl Engine {
             if piece.kind == PieceKind::King {
                 continue;
             }
-            if enemy_attacks.contains(sq) && !friendly_attacks.contains(sq) {
-                penalty += piece.kind.value() as i32 / 2;
+
+            let piece_value = MG_PIECE_VALUES[piece.kind as usize];
+            if enemy_attacks.contains(sq) {
+                if !friendly_attacks.contains(sq) {
+                    // Completely undefended
+                    penalty += piece_value as i32 / 2;
+                } else {
+                    // Defended but check if attacked by cheaper piece
+                    // Find cheapest attacker
+                    for kind in 0..5usize {
+                        let attacker = (!piece.color).kind(kind.try_into().unwrap());
+                        if bc.get_board(&attacker).0 & bc.piece_attacks(sq, attacker).0 != 0 {
+                            let attacker_value = MG_PIECE_VALUES[attacker.kind as usize];
+                            if attacker_value < piece_value {
+                                penalty += (piece_value - attacker_value) as i32 / 2;
+                            }
+                            break; // only care about cheapest
+                        }
+                    }
+                }
             }
         }
 
@@ -1930,8 +1951,9 @@ impl Engine {
         let safe_defenders = (around & friendly_pieces & !enemy_attacks).0.count_ones() as i32;
         let attacked_empty = (around & !friendly_pieces & enemy_attacks).0.count_ones() as i32;
 
-        safe_defenders * 10 - attacked_empty * 10
+        safe_defenders * 10 - attacked_empty * 20
     }
+
     fn static_eval(&self) -> i32 {
         let color = if self.game.white_turn {
             Color::White
@@ -1973,16 +1995,6 @@ impl Engine {
                     PieceKind::King => (MG_KING_TABLE[table_sq], EG_KING_TABLE[table_sq]),
                 };
 
-                // Base material
-                let material = match piece.kind {
-                    PieceKind::Pawn => 100,
-                    PieceKind::Knight => 300,
-                    PieceKind::Bishop => 300,
-                    PieceKind::Rook => 500,
-                    PieceKind::Queen => 900,
-                    PieceKind::King => 0,
-                };
-
                 if piece.kind == PieceKind::King {
                     if piece.color == Color::White {
                         white_king_sq = sq;
@@ -1998,8 +2010,11 @@ impl Engine {
                         enemy_bishops += 1;
                     }
                 }
-                mg[color_idx] += mg_val + material;
-                eg[color_idx] += eg_val + material;
+
+                let kind_idx = piece.kind as usize;
+                mg[color_idx] += mg_val + MG_PIECE_VALUES[kind_idx];
+                eg[color_idx] += eg_val + EG_PIECE_VALUES[kind_idx];
+
                 game_phase += GAMEPHASE_INC[piece.kind as usize];
             }
         }
@@ -2078,24 +2093,24 @@ impl Engine {
         let mut friendly_pawns_clone = friendly_pawns;
         while let Some(pawn_sq) = friendly_pawns_clone.pop_lsb() {
             let (file, rank) = BC::decode_tile(pawn_sq);
+
             let mut scan_mask = file_mask << file;
+
             if file > 0 {
                 scan_mask |= file_mask << (file - 1);
             }
             if file < 7 {
                 scan_mask |= file_mask << (file + 1);
             }
-            // Dont look behind pawn
+
             if color == Color::White {
-                scan_mask &= !0u64 << (rank * 8); // mask out squares below
+                scan_mask &= !0u64 << (rank * 8);
             } else {
-                scan_mask &= !(!0u64 << (rank * 8)); // mask out squares above
+                scan_mask &= (1u64 << (rank * 8)).wrapping_sub(1);
             }
 
-            scan_mask &= enemy_pawns.0;
-
             // println!("{} {:?}", BitBoard(scan_mask), color);
-            if scan_mask == 0 {
+            if scan_mask & enemy_pawns.0 == 0 {
                 let bonus_rank = if color == Color::White {
                     rank
                 } else {
@@ -2103,6 +2118,21 @@ impl Engine {
                 };
 
                 bonus += PASSED_PAWN_BONUS[bonus_rank as usize];
+            }
+
+            let adjacent_file_mask = {
+                let mut m = file_mask << file;
+                if file > 0 {
+                    m |= file_mask << (file - 1);
+                }
+                if file < 7 {
+                    m |= file_mask << (file + 1);
+                }
+                m & !(file_mask << file) // exclude own file
+            };
+
+            if adjacent_file_mask & friendly_pawns.0 == 0 {
+                bonus -= 15;
             }
         }
 
@@ -2130,17 +2160,52 @@ impl Engine {
 
         for depth in 1..=max_depth {
             self.history.clear();
+            let mut delta = 100;
+            let guess = self.last_score;
 
-            if let Some(mv) = self.search_at_depth(depth, &start, deadline) {
-                best_move = Some(mv);
-            }
+            let mut alpha = guess - delta;
+            let mut beta = guess + delta;
 
-            if self.stop {
-                break;
+            if depth == 1 {
+                if let Some((mv, score)) =
+                    self.search_at_depth(depth, -999_999_999, 999_999_999, &start, deadline)
+                {
+                    best_move = Some(mv);
+                    self.last_score = score;
+                }
+            } else {
+                loop {
+                    match self.search_at_depth(depth, alpha, beta, &start, deadline) {
+                        None => break,
+                        Some((mv, score)) => {
+                            if score <= alpha {
+                                delta *= 2;
+
+                                alpha = guess - delta;
+                            } else if score >= beta {
+                                delta *= 2;
+
+                                beta = guess + delta;
+                            } else {
+                                best_move = Some(mv);
+                                self.last_score = score;
+                                break;
+                            }
+                            if delta > 100000 {
+                                alpha = -999_999_999;
+                                beta = 999_999_999;
+                            }
+                        }
+                    }
+
+                    if self.stop {
+                        break;
+                    }
+                }
             }
 
             let elapsed = start.elapsed().as_millis();
-            let score = self.last_score; // add this field to Engine
+            let score = self.last_score;
 
             let score_str = if score >= 900000 {
                 format!("mate {}", depth / 2)
@@ -2155,17 +2220,33 @@ impl Engine {
                 depth, score_str, self.nodes, elapsed
             );
 
+            eprintln!(
+                "info depth {} score {} nodes {} time {} bestmove {:?}",
+                depth, score_str, self.nodes, elapsed, best_move
+            );
+
+            println!("last_score after depth {}: {}", depth, self.last_score);
+
             if score >= 900000 || score <= -900000 {
-                break; // found mate, no need to search deeper
+                break;
+            }
+
+            if elapsed as u64 >= deadline {
+                break;
             }
         }
 
         best_move
     }
 
-    fn search_at_depth(&mut self, depth: u8, start: &Instant, deadline: u64) -> Option<Move> {
-        let mut alpha = -999_999_999;
-        let mut beta = 999_999_999;
+    fn search_at_depth(
+        &mut self,
+        depth: u8,
+        mut alpha: i32,
+        mut beta: i32,
+        start: &Instant,
+        deadline: u64,
+    ) -> Option<(Move, i32)> {
         let mut best_move = None;
 
         let color = if self.game.white_turn {
@@ -2209,15 +2290,12 @@ impl Engine {
             let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline);
             let mut mv_s = BC::encode_notation(mv.from);
             mv_s.extend(BC::encode_notation(mv.to).chars());
-
-            // self.debug_eval();
-            // println!();
+            println!("move {:?} score {}", mv, score);
             self.game.undo_move(&undo);
 
             if score > alpha {
                 alpha = score;
-                best_move = Some(*mv);
-                self.last_score = alpha;
+                best_move = Some((*mv, score));
             }
         }
 
@@ -2466,11 +2544,15 @@ impl Engine {
             alpha = stand_pat;
         }
 
+        if stand_pat + 200 < alpha {
+            return alpha;
+        }
+
         let move_gen = MoveGen::new(&self.game);
         let moves = move_gen
             .pseudo_legal_moves(color)
             .into_iter()
-            .filter(|m| m.flags.contains(MoveFlags::CAPTURE))
+            .filter(|m| m.flags.contains(MoveFlags::CAPTURE) && self.capture_score(m) >= 0)
             .collect::<Vec<_>>();
 
         let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
@@ -2519,20 +2601,135 @@ impl Engine {
     }
 
     fn debug_eval(&mut self) {
-        // println!("{}", self.game.board_collection);
-        let move_gen = MoveGen::new_engine(&self);
+        self.refresh_cache();
+
         let color = if self.game.white_turn {
             Color::White
         } else {
             Color::Black
         };
+        let bc = &self.game.board_collection;
+        let friendly_attacks = self.cached_attacks[color as usize];
+        let enemy_attacks = self.cached_attacks[(!color) as usize];
+        let friendly_pieces = bc.occupied_color(color);
+        let enemy_pieces = bc.occupied_color(!color);
 
-        self.refresh_cache();
-        let eval = self.static_eval();
+        let mut mg = [0i32; 2];
+        let mut eg = [0i32; 2];
+        let mut game_phase = 0i32;
+        let mut white_king_sq = 0u8;
+        let mut black_king_sq = 0u8;
+        let mut friendly_bishops = 0u8;
+        let mut enemy_bishops = 0u8;
 
-        println!("Static eval: {}", eval);
-        println!("White material: {}", self.material_score(Color::White));
-        println!("Black material: {}", self.material_score(Color::Black));
+        for sq in 0..64u8 {
+            if let Some(piece) = bc.piece_at_index(sq) {
+                let color_idx = piece.color as usize;
+                let table_sq = if piece.color == Color::White {
+                    sq as usize
+                } else {
+                    (sq ^ 56) as usize
+                };
+
+                let (mg_val, eg_val) = match piece.kind {
+                    PieceKind::Pawn => (MG_PAWN_TABLE[table_sq], EG_PAWN_TABLE[table_sq]),
+                    PieceKind::Knight => (MG_KNIGHT_TABLE[table_sq], EG_KNIGHT_TABLE[table_sq]),
+                    PieceKind::Bishop => (MG_BISHOP_TABLE[table_sq], EG_BISHOP_TABLE[table_sq]),
+                    PieceKind::Rook => (MG_ROOK_TABLE[table_sq], EG_ROOK_TABLE[table_sq]),
+                    PieceKind::Queen => (MG_QUEEN_TABLE[table_sq], EG_QUEEN_TABLE[table_sq]),
+                    PieceKind::King => (MG_KING_TABLE[table_sq], EG_KING_TABLE[table_sq]),
+                };
+
+                let material = match piece.kind {
+                    PieceKind::Pawn => 100,
+                    PieceKind::Knight => 300,
+                    PieceKind::Bishop => 300,
+                    PieceKind::Rook => 500,
+                    PieceKind::Queen => 900,
+                    PieceKind::King => 0,
+                };
+
+                if piece.kind == PieceKind::King {
+                    if piece.color == Color::White {
+                        white_king_sq = sq;
+                    } else {
+                        black_king_sq = sq;
+                    }
+                }
+                if piece.kind == PieceKind::Bishop {
+                    if piece.color == color {
+                        friendly_bishops += 1;
+                    } else {
+                        enemy_bishops += 1;
+                    }
+                }
+
+                mg[color_idx] += mg_val / 5 + material;
+                eg[color_idx] += eg_val / 5 + material;
+                game_phase += GAMEPHASE_INC[piece.kind as usize];
+            }
+        }
+
+        let side = if self.game.white_turn { 0 } else { 1 };
+        let other = 1 - side;
+        let mg_phase = game_phase.min(24);
+        let eg_phase = 24 - mg_phase;
+
+        let pst_score =
+            (mg[side] - mg[other]) * mg_phase / 24 + (eg[side] - eg[other]) * eg_phase / 24;
+
+        let friendly_pawns = *bc.get_board(&color.kind(PieceKind::Pawn));
+        let enemy_pawns = *bc.get_board(&(!color).kind(PieceKind::Pawn));
+
+        let king_sq = if self.game.white_turn {
+            white_king_sq
+        } else {
+            black_king_sq
+        };
+        let enemy_king_sq = if self.game.white_turn {
+            black_king_sq
+        } else {
+            white_king_sq
+        };
+
+        let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
+            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
+        let control = self.control_bonus();
+        let king_safety = (self.king_safety(king_sq, friendly_pieces, enemy_attacks)
+            - self.king_safety(enemy_king_sq, enemy_pieces, friendly_attacks))
+            * mg_phase
+            / 24;
+        let pawns = self.pawn_bonus(friendly_pawns, enemy_pawns, color)
+            - self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
+        let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
+        let castling = {
+            let our = if self.game.white_turn {
+                self.game.k_white as i32 + self.game.q_white as i32
+            } else {
+                self.game.k_black as i32 + self.game.q_black as i32
+            };
+            let their = if self.game.white_turn {
+                self.game.k_black as i32 + self.game.q_black as i32
+            } else {
+                self.game.k_white as i32 + self.game.q_white as i32
+            };
+            (our - their) * 20
+        };
+
+        println!("=== Eval Breakdown ===");
+        println!("PST + material: {}", pst_score);
+        println!("hanging:        {}", -hanging);
+        println!("control:        {}", control);
+        println!("king_safety:    {}", king_safety);
+        let a = self.pawn_bonus(friendly_pawns, enemy_pawns, color);
+        let b = self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
+        println!("pawn bonus friendly: {} enemy: {} diff: {}", a, b, a - b);
+        println!("bishops:        {}", bishops);
+        println!("castling:       {}", castling);
+        println!(
+            "total:          {}",
+            pst_score - hanging + control + king_safety + pawns + bishops + castling
+        );
         println!("Hash: {}", self.game.hash);
         println!("Hash check: {}", zobrist().hash(&self.game));
     }

@@ -1,11 +1,12 @@
 #!/bin/bash
 cutechess-cli \
   -engine cmd=./target/release/chess-badfish name=Newest proto=uci \
-  -engine cmd=./saved-brains/v4 name=BadFish4 proto=uci \
+  -engine cmd=./saved-brains/v5 name=BadFish5 proto=uci \
   -each tc=10+0.1 \
   -games 40 \
   -repeat \
   -rounds 10 \
   -concurrency 10 \
-  -resign movecount=5 score=600
+  -resign movecount=5 score=600 \
+  -openings file=openings.pgn
   # -pgnout v1_v2.pgn \
