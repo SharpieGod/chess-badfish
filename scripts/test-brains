@@ -4,7 +4,7 @@ cutechess-cli \
   -engine cmd=./saved-brains/v7 name=BadFish7 proto=uci \
   -each tc=10+0.1 \
   -games 2 \
-  -rounds 100 \
+  -rounds 5000 \
   -repeat \
   -concurrency 5 \
   -resign movecount=5 score=600 \
