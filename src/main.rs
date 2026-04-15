@@ -1512,22 +1512,22 @@ impl Game {
                 }
             }
         }
-        if m.from == 0 || m.to == 0 {
+        if (m.from == 0 || m.to == 0) && self.q_white {
             self.q_white = false;
             self.hash ^= zobrist().castling[1];
         }
 
-        if m.from == 7 || m.to == 7 {
+        if (m.from == 7 || m.to == 7) && self.k_white {
             self.k_white = false;
             self.hash ^= zobrist().castling[0];
         }
 
-        if m.from == 56 || m.to == 56 {
+        if (m.from == 56 || m.to == 56) && self.q_black {
             self.q_black = false;
             self.hash ^= zobrist().castling[3];
         }
 
-        if m.from == 63 || m.to == 63 {
+        if (m.from == 63 || m.to == 63) && self.k_black {
             self.k_black = false;
             self.hash ^= zobrist().castling[2];
         }
@@ -1713,8 +1713,9 @@ struct Engine {
     last_score: i32,
     stop: bool,
     cached_attacks: [BitBoard; 2],
-
     cache_hash: u64,
+    killers: [[Option<Move>; 2]; 64],
+    history_table: [[[i32; 64]; 64]; 2],
 }
 
 // Values from PeSTO
@@ -1837,6 +1838,8 @@ impl Engine {
             nodes: 0,
             cache_hash: 0,
             cached_attacks: [BitBoard(0); 2],
+            killers: [[None; 2]; 64],
+            history_table: [[[0; 64]; 64]; 2],
         }
     }
 
@@ -2119,6 +2122,9 @@ impl Engine {
     }
 
     fn search(&mut self, max_depth: u8, time_ms: u64) -> Option<Move> {
+        self.killers = [[None; 2]; 64];
+        self.history_table = [[[0; 64]; 64]; 2];
+
         self.tt.iter_mut().for_each(|e| *e = None);
         let start = Instant::now();
         let mut best_move = None;
@@ -2151,7 +2157,6 @@ impl Engine {
             };
 
             loop {
-                eprintln!("depth {} window [{}, {}]", depth, alpha, beta);
                 match self.search_at_depth(depth, alpha, beta, &start, deadline) {
                     None => break, // timeout or no legal moves
                     Some((mv, score)) => {
@@ -2256,7 +2261,7 @@ impl Engine {
                 }
             }
         }
-        moves[1..].sort_by_key(|m| -self.move_score(m));
+        moves[1..].sort_by_key(|m| -self.move_score(m, 0, color));
 
         // Track best regardless of whether it beats alpha — needed for fail-low detection
         let mut best_move = moves[0];
@@ -2269,7 +2274,7 @@ impl Engine {
             }
 
             let undo = self.game.make_move(mv);
-            let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline, true);
+            let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, 0);
             self.game.undo_move(&undo);
 
             if self.stop {
@@ -2295,12 +2300,13 @@ impl Engine {
 
     fn negamax(
         &mut self,
-        depth: u8,
+        mut depth: u8,
         mut alpha: i32,
         mut beta: i32,
         start: &Instant,
         deadline: u64,
         can_null: bool,
+        ply: u8,
     ) -> i32 {
         if self.nodes & 2047 == 0 {
             if start.elapsed().as_millis() as u64 >= deadline {
@@ -2320,12 +2326,6 @@ impl Engine {
         let hash = self.game.hash;
         let search_count = self.history.get(&hash).copied().unwrap_or(0);
         let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
-
-        let color = if self.game.white_turn {
-            Color::White
-        } else {
-            Color::Black
-        };
 
         if search_count >= 2 || game_count >= 2 {
             self.refresh_cache();
@@ -2348,19 +2348,25 @@ impl Engine {
                 }
             }
         }
-        if depth == 0 {
-            return self.quiescence(alpha, beta);
-        }
+
         let color = if self.game.white_turn {
             Color::White
         } else {
             Color::Black
         };
+
         let in_check = self.game.board_collection.check_info(color).in_check;
 
+        depth = if in_check { depth + 1 } else { depth };
+
+        if depth == 0 {
+            return self.quiescence(alpha, beta);
+        }
+        self.refresh_cache();
+        let static_eval = self.static_eval();
         // Null move pruning
+
         if can_null && !in_check && depth >= 3 && beta < 900_000 {
-            // If has any piece other than pawns
             let bc = self.game.board_collection;
             let has_non_pawns = (bc.occupied_color(color).0
                 & !(bc.get_board(&color.kind(PieceKind::Pawn)).0
@@ -2370,43 +2376,61 @@ impl Engine {
             if has_non_pawns {
                 self.refresh_cache();
                 let static_eval = self.static_eval();
-                let r = 3 + (depth / 6) as u8 + if static_eval - beta > 200 { 1 } else { 0 };
-                let reduced_depth = depth.saturating_sub(1 + r);
 
-                let prev_hash = self.game.hash;
-                self.game.white_turn = !self.game.white_turn;
-                self.game.hash ^= zobrist().black_to_move;
-                let prev_ep = self.game.en_passant_square;
-                if let Some(ep) = self.game.en_passant_square {
-                    let (file, _) = BC::decode_tile(ep);
-                    self.game.hash ^= zobrist().en_passant[file as usize];
-                }
+                if static_eval >= beta {
+                    let r = 3 + (depth / 6) as u8 + if static_eval - beta > 200 { 1 } else { 0 };
+                    let reduced_depth = depth.saturating_sub(1 + r);
 
-                self.game.en_passant_square = None;
+                    let prev_hash = self.game.hash;
+                    self.game.white_turn = !self.game.white_turn;
+                    self.game.hash ^= zobrist().black_to_move;
+                    let prev_ep = self.game.en_passant_square;
+                    if let Some(ep) = self.game.en_passant_square {
+                        let (file, _) = BC::decode_tile(ep);
+                        self.game.hash ^= zobrist().en_passant[file as usize];
+                    }
 
-                let score = -self.negamax(depth - 3, -beta, -beta + 1, start, deadline, false);
+                    self.game.en_passant_square = None;
 
-                self.game.white_turn = !self.game.white_turn;
-                self.game.en_passant_square = prev_ep;
-                self.game.hash = prev_hash;
-                self.cache_hash = 0; // force cache refresh
+                    let score = -self.negamax(
+                        reduced_depth,
+                        -beta,
+                        -beta + 1,
+                        start,
+                        deadline,
+                        false,
+                        ply + 1,
+                    );
 
-                // Position so good, that oponent wouldnt let us reach it
-                if score >= beta {
-                    // Verification search at high depth to catch zugzwang
-                    if depth >= 10 {
-                        let verify =
-                            self.negamax(depth - r - 1, beta - 1, beta, start, deadline, false);
-                        if verify >= beta {
-                            return score; // fail-soft
+                    self.game.white_turn = !self.game.white_turn;
+                    self.game.en_passant_square = prev_ep;
+                    self.game.hash = prev_hash;
+                    self.cache_hash = 0; // force cache refresh
+
+                    // Position so good, that oponent wouldnt let us reach it
+                    if score >= beta {
+                        // Verification search at high depth to catch zugzwang
+                        if depth >= 10 {
+                            let verify = self.negamax(
+                                depth - r - 1,
+                                beta - 1,
+                                beta,
+                                start,
+                                deadline,
+                                false,
+                                ply + 1,
+                            );
+                            if verify >= beta {
+                                return score; // fail-soft
+                            }
+                            // verification failed — fall through to normal search
+                        } else {
+                            // Don't return mate scores from null move
+                            if score >= 900_000 {
+                                return beta;
+                            }
+                            return score;
                         }
-                        // verification failed — fall through to normal search
-                    } else {
-                        // Don't return mate scores from null move
-                        if score >= 900_000 {
-                            return beta;
-                        }
-                        return score;
                     }
                 }
             }
@@ -2443,7 +2467,7 @@ impl Engine {
         }
 
         // sort the rest
-        moves[1..].sort_by_key(|m| -self.move_score(m));
+        moves[1..].sort_by_key(|m| -self.move_score(m, ply, color));
 
         *self.history.entry(hash).or_insert(0) += 1;
         let mut best_move = None;
@@ -2458,24 +2482,71 @@ impl Engine {
                 && !self.game.board_collection.is_in_check(!color)
             {
                 // Search at reduced depth first
-                let reduced = -self.negamax(depth - 2, -alpha - 1, -alpha, start, deadline, true);
+                let reduced = -self.negamax(
+                    depth - 2,
+                    -alpha - 1,
+                    -alpha,
+                    start,
+                    deadline,
+                    true,
+                    ply + 1,
+                );
 
                 // If it beats alpha, re-search at full depth
                 if reduced > alpha {
-                    -self.negamax(depth - 1, -beta, -alpha, start, deadline, true)
+                    -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, ply + 1)
                 } else {
                     reduced
                 }
             } else {
-                -self.negamax(depth - 1, -beta, -alpha, start, deadline, true)
+                -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, ply + 1)
             };
+
             self.game.undo_move(&u);
 
             if score >= beta {
+                // Move too good
+                if !m.flags.contains(MoveFlags::CAPTURE)
+                    && !m.flags.intersects(
+                        MoveFlags::PROMOTE_Q
+                            | MoveFlags::PROMOTE_R
+                            | MoveFlags::PROMOTE_N
+                            | MoveFlags::PROMOTE_B,
+                    )
+                {
+                    let bonus = (depth as i32) * (depth as i32);
+                    let color_idx = color as usize;
+                    self.history_table[color_idx][m.from as usize][m.to as usize] += bonus;
+
+                    for prev in moves[..i].iter() {
+                        if !prev.flags.contains(MoveFlags::CAPTURE)
+                            && !prev.flags.intersects(
+                                MoveFlags::PROMOTE_Q
+                                    | MoveFlags::PROMOTE_R
+                                    | MoveFlags::PROMOTE_N
+                                    | MoveFlags::PROMOTE_B,
+                            )
+                        {
+                            self.history_table[color_idx][prev.from as usize][prev.to as usize] -=
+                                bonus;
+                        }
+                    }
+
+                    let dominated = self.killers[ply as usize][0];
+                    let dominated_matches = dominated
+                        .map(|k| k.from == m.from && k.to == m.to)
+                        .unwrap_or(false);
+
+                    if !dominated_matches {
+                        self.killers[ply as usize][1] = self.killers[ply as usize][0];
+                        self.killers[ply as usize][0] = Some(*m);
+                    }
+                }
+
                 self.tt[tt_idx] = Some(TTEntry {
                     hash,
                     depth,
-                    score: beta,
+                    score: score,
                     flag: TTFlag::LowerBound,
                     best_move: Some(*m),
                 });
@@ -2520,16 +2591,26 @@ impl Engine {
         alpha
     }
 
-    fn move_score(&self, m: &Move) -> i32 {
+    fn move_score(&self, m: &Move, ply: u8, color: Color) -> i32 {
         if m.flags.contains(MoveFlags::CAPTURE) {
             return 10000 + self.capture_score(m);
         }
         if m.flags.intersects(MoveFlags::PROMOTE_Q) {
             return 9000;
         }
-        0
-    }
+        if let Some(k) = self.killers[ply as usize][0] {
+            if k.from == m.from && k.to == m.to {
+                return 8000;
+            }
+        }
+        if let Some(k) = self.killers[ply as usize][1] {
+            if k.from == m.from && k.to == m.to {
+                return 7000;
+            }
+        }
 
+        self.history_table[color as usize][m.from as usize][m.to as usize]
+    }
     fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
         let hash = self.game.hash;
         let search_count = self.history.get(&hash).copied().unwrap_or(0);
@@ -2549,7 +2630,7 @@ impl Engine {
         let stand_pat = self.static_eval();
 
         if stand_pat >= beta {
-            return beta;
+            return stand_pat;
         }
         if stand_pat > alpha {
             alpha = stand_pat;
@@ -2575,7 +2656,7 @@ impl Engine {
             self.game.undo_move(&u);
 
             if score >= beta {
-                return beta;
+                return score;
             }
             if score > alpha {
                 alpha = score;
