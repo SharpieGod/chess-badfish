@@ -260,25 +260,6 @@ impl BitBoardCollection {
         }
     }
 
-    fn compute_control(&self, color: Color) -> [[i32; 64]; 6] {
-        let mut control = [[0i32; 64]; 6];
-
-        for kind in 0..6usize {
-            let piece = color.kind(kind.try_into().unwrap());
-
-            let mut bb = *self.get_board(&piece);
-
-            while let Some(idx) = bb.pop_lsb() {
-                let mut piece_attakcs = self.piece_attacks(idx, piece);
-                while let Some(sq) = piece_attakcs.pop_lsb() {
-                    control[kind][sq as usize] += 1;
-                }
-            }
-        }
-
-        control
-    }
-
     fn attacks_by(&self, color: Color) -> BitBoard {
         let mut attacks = BitBoard(0);
 
@@ -1732,7 +1713,7 @@ struct Engine {
     last_score: i32,
     stop: bool,
     cached_attacks: [BitBoard; 2],
-    cached_weighted_control: [i32; 2],
+
     cache_hash: u64,
 }
 
@@ -1856,7 +1837,6 @@ impl Engine {
             nodes: 0,
             cache_hash: 0,
             cached_attacks: [BitBoard(0); 2],
-            cached_weighted_control: [0; 2],
         }
     }
 
@@ -1871,21 +1851,15 @@ impl Engine {
             let color = Color::try_from(c).unwrap();
             let mut attacks = BitBoard(0);
 
-            let mut weighted_control = 0;
             for kind in 0..6usize {
                 let piece = color.kind(kind.try_into().unwrap());
                 let mut bb = *bc.get_board(&piece);
                 while let Some(idx) = bb.pop_lsb() {
-                    let mut piece_attack = bc.piece_attacks(idx, piece);
+                    let piece_attack = bc.piece_attacks(idx, piece);
                     attacks.0 |= piece_attack.0;
-                    if kind < 5 {
-                        while let Some(sq) = piece_attack.pop_lsb() {
-                            weighted_control += CONTROL_WEIGHTS[kind] * CENTER_BONUS[sq as usize];
-                        }
-                    }
                 }
             }
-            self.cached_weighted_control[c] = weighted_control;
+
             self.cached_attacks[c] = attacks;
         }
 
@@ -1933,11 +1907,6 @@ impl Engine {
         penalty
     }
 
-    fn control_bonus(&self) -> i32 {
-        let color = if self.game.white_turn { 0 } else { 1 };
-        self.cached_weighted_control[color] - self.cached_weighted_control[1 - color]
-    }
-
     fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard, enemy_attacks: BitBoard) -> i32 {
         let mut around = BitBoard(0);
         let (file, rank) = BC::decode_tile(king_sq);
@@ -1951,7 +1920,7 @@ impl Engine {
         let safe_defenders = (around & friendly_pieces & !enemy_attacks).0.count_ones() as i32;
         let attacked_empty = (around & !friendly_pieces & enemy_attacks).0.count_ones() as i32;
 
-        safe_defenders * 10 - attacked_empty * 20
+        safe_defenders * 4 - attacked_empty * 8
     }
 
     fn static_eval(&self) -> i32 {
@@ -2027,8 +1996,9 @@ impl Engine {
         let mg_phase = game_phase.min(24);
         let eg_phase = 24 - mg_phase;
 
-        let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
-            - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
+        // let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
+        //     - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
+        let hanging = 0;
 
         let king_sq = if self.game.white_turn {
             white_king_sq
@@ -2056,7 +2026,6 @@ impl Engine {
 
         let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
 
-        let control = self.control_bonus();
         let king_safety = (self.king_safety(king_sq, friendly_pieces, enemy_attacks)
             - self.king_safety(enemy_king_sq, enemy_pieces, friendly_attacks))
             * mg_phase
@@ -2077,7 +2046,6 @@ impl Engine {
         };
 
         (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
-            + control
             + king_safety
             + bishops
             + castling_rights_bonus
@@ -2157,50 +2125,66 @@ impl Engine {
         self.nodes = 0;
         self.stop = false;
         let deadline = time_ms;
+        let mut score_history: Vec<i32> = Vec::new();
 
         for depth in 1..=max_depth {
             self.history.clear();
-            let mut delta = 100;
-            let guess = self.last_score;
-
-            let mut alpha = guess - delta;
-            let mut beta = guess + delta;
-
-            if depth == 1 {
-                if let Some((mv, score)) =
-                    self.search_at_depth(depth, -999_999_999, 999_999_999, &start, deadline)
-                {
-                    best_move = Some(mv);
-                    self.last_score = score;
-                }
+            let mut delta = if score_history.len() >= 4 {
+                let recent_swing = (score_history[score_history.len() - 1]
+                    - score_history[score_history.len() - 3])
+                    .abs();
+                50.max(recent_swing / 2).min(200)
             } else {
-                loop {
-                    match self.search_at_depth(depth, alpha, beta, &start, deadline) {
-                        None => break,
-                        Some((mv, score)) => {
-                            if score <= alpha {
-                                delta *= 2;
+                50
+            };
 
-                                alpha = guess - delta;
-                            } else if score >= beta {
-                                delta *= 2;
+            let guess = if score_history.len() >= 2 {
+                score_history[score_history.len() - 2]
+            } else {
+                self.last_score
+            };
 
-                                beta = guess + delta;
-                            } else {
-                                best_move = Some(mv);
-                                self.last_score = score;
-                                break;
-                            }
-                            if delta > 100000 {
-                                alpha = -999_999_999;
+            let (mut alpha, mut beta) = if depth == 1 {
+                (-999_999_999, 999_999_999)
+            } else {
+                (guess - delta, guess + delta)
+            };
+
+            loop {
+                eprintln!("depth {} window [{}, {}]", depth, alpha, beta);
+                match self.search_at_depth(depth, alpha, beta, &start, deadline) {
+                    None => break, // timeout or no legal moves
+                    Some((mv, score)) => {
+                        if score <= alpha {
+                            // fail-low: widen alpha, keep beta
+                            delta *= 2;
+                            alpha = guess - delta;
+                        } else if score >= beta {
+                            // fail-high: widen beta, keep alpha, but still record the move
+                            best_move = Some(mv);
+                            self.last_score = score;
+                            if score >= 900_000 {
                                 beta = 999_999_999;
+                            } else {
+                                delta *= 2;
+                                beta = guess + delta;
                             }
+                        } else {
+                            // score is inside window — done
+                            best_move = Some(mv);
+                            self.last_score = score;
+                            break;
+                        }
+
+                        if delta > 100_000 {
+                            alpha = -999_999_999;
+                            beta = 999_999_999;
                         }
                     }
+                }
 
-                    if self.stop {
-                        break;
-                    }
+                if self.stop {
+                    break;
                 }
             }
 
@@ -2220,20 +2204,15 @@ impl Engine {
                 depth, score_str, self.nodes, elapsed
             );
 
-            eprintln!(
-                "info depth {} score {} nodes {} time {} bestmove {:?}",
-                depth, score_str, self.nodes, elapsed, best_move
-            );
-
-            println!("last_score after depth {}: {}", depth, self.last_score);
-
             if score >= 900000 || score <= -900000 {
                 break;
             }
 
-            if elapsed as u64 >= deadline {
+            if self.stop {
                 break;
             }
+
+            score_history.push(self.last_score);
         }
 
         best_move
@@ -2243,12 +2222,10 @@ impl Engine {
         &mut self,
         depth: u8,
         mut alpha: i32,
-        mut beta: i32,
+        beta: i32,
         start: &Instant,
         deadline: u64,
     ) -> Option<(Move, i32)> {
-        let mut best_move = None;
-
         let color = if self.game.white_turn {
             Color::White
         } else {
@@ -2257,11 +2234,14 @@ impl Engine {
 
         let moves = {
             let move_gen = MoveGen::new(&self.game);
-            let pseudo = move_gen.pseudo_legal_moves(color);
-            pseudo
+            move_gen.pseudo_legal_moves(color)
         };
         let hash = self.game.hash;
         let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
+
+        if moves.is_empty() {
+            return None;
+        }
 
         let tt_idx = (hash as usize) & (self.tt.len() - 1);
         if let Some(entry) = self.tt[tt_idx] {
@@ -2276,30 +2256,41 @@ impl Engine {
                 }
             }
         }
-
-        // sort the rest
         moves[1..].sort_by_key(|m| -self.move_score(m));
+
+        // Track best regardless of whether it beats alpha — needed for fail-low detection
+        let mut best_move = moves[0];
+        let mut best_score = i32::MIN;
 
         for mv in moves.iter() {
             if start.elapsed().as_millis() as u64 >= deadline {
                 self.stop = true;
-                return None; // abort
+                return None; // genuine timeout
             }
 
             let undo = self.game.make_move(mv);
-            let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline);
-            let mut mv_s = BC::encode_notation(mv.from);
-            mv_s.extend(BC::encode_notation(mv.to).chars());
-            println!("move {:?} score {}", mv, score);
+            let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline, true);
             self.game.undo_move(&undo);
+
+            if self.stop {
+                return None;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_move = *mv;
+            }
 
             if score > alpha {
                 alpha = score;
-                best_move = Some((*mv, score));
+            }
+
+            if alpha >= beta {
+                break; // fail-high cutoff
             }
         }
 
-        best_move
+        Some((best_move, best_score))
     }
 
     fn negamax(
@@ -2309,6 +2300,7 @@ impl Engine {
         mut beta: i32,
         start: &Instant,
         deadline: u64,
+        can_null: bool,
     ) -> i32 {
         if self.nodes & 2047 == 0 {
             if start.elapsed().as_millis() as u64 >= deadline {
@@ -2367,7 +2359,7 @@ impl Engine {
         let in_check = self.game.board_collection.check_info(color).in_check;
 
         // Null move pruning
-        if !in_check && depth >= 3 {
+        if can_null && !in_check && depth >= 3 && beta < 900_000 {
             // If has any piece other than pawns
             let bc = self.game.board_collection;
             let has_non_pawns = (bc.occupied_color(color).0
@@ -2376,6 +2368,11 @@ impl Engine {
                 != 0;
 
             if has_non_pawns {
+                self.refresh_cache();
+                let static_eval = self.static_eval();
+                let r = 3 + (depth / 6) as u8 + if static_eval - beta > 200 { 1 } else { 0 };
+                let reduced_depth = depth.saturating_sub(1 + r);
+
                 let prev_hash = self.game.hash;
                 self.game.white_turn = !self.game.white_turn;
                 self.game.hash ^= zobrist().black_to_move;
@@ -2387,7 +2384,7 @@ impl Engine {
 
                 self.game.en_passant_square = None;
 
-                let score = -self.negamax(depth - 3, -beta, -beta + 1, start, deadline);
+                let score = -self.negamax(depth - 3, -beta, -beta + 1, start, deadline, false);
 
                 self.game.white_turn = !self.game.white_turn;
                 self.game.en_passant_square = prev_ep;
@@ -2396,7 +2393,21 @@ impl Engine {
 
                 // Position so good, that oponent wouldnt let us reach it
                 if score >= beta {
-                    return beta;
+                    // Verification search at high depth to catch zugzwang
+                    if depth >= 10 {
+                        let verify =
+                            self.negamax(depth - r - 1, beta - 1, beta, start, deadline, false);
+                        if verify >= beta {
+                            return score; // fail-soft
+                        }
+                        // verification failed — fall through to normal search
+                    } else {
+                        // Don't return mate scores from null move
+                        if score >= 900_000 {
+                            return beta;
+                        }
+                        return score;
+                    }
                 }
             }
         }
@@ -2447,16 +2458,16 @@ impl Engine {
                 && !self.game.board_collection.is_in_check(!color)
             {
                 // Search at reduced depth first
-                let reduced = -self.negamax(depth - 2, -alpha - 1, -alpha, start, deadline);
+                let reduced = -self.negamax(depth - 2, -alpha - 1, -alpha, start, deadline, true);
 
                 // If it beats alpha, re-search at full depth
                 if reduced > alpha {
-                    -self.negamax(depth - 1, -beta, -alpha, start, deadline)
+                    -self.negamax(depth - 1, -beta, -alpha, start, deadline, true)
                 } else {
                     reduced
                 }
             } else {
-                -self.negamax(depth - 1, -beta, -alpha, start, deadline)
+                -self.negamax(depth - 1, -beta, -alpha, start, deadline, true)
             };
             self.game.undo_move(&u);
 
@@ -2474,7 +2485,7 @@ impl Engine {
                         self.history.remove(&hash);
                     }
                 }
-                return beta;
+                return score;
             }
 
             if score > alpha {
@@ -2664,8 +2675,8 @@ impl Engine {
                     }
                 }
 
-                mg[color_idx] += mg_val / 5 + material;
-                eg[color_idx] += eg_val / 5 + material;
+                mg[color_idx] += mg_val + material;
+                eg[color_idx] += eg_val + material;
                 game_phase += GAMEPHASE_INC[piece.kind as usize];
             }
         }
@@ -2694,7 +2705,7 @@ impl Engine {
 
         let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
             - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
-        let control = self.control_bonus();
+
         let king_safety = (self.king_safety(king_sq, friendly_pieces, enemy_attacks)
             - self.king_safety(enemy_king_sq, enemy_pieces, friendly_attacks))
             * mg_phase
@@ -2718,8 +2729,7 @@ impl Engine {
 
         println!("=== Eval Breakdown ===");
         println!("PST + material: {}", pst_score);
-        println!("hanging:        {}", -hanging);
-        println!("control:        {}", control);
+
         println!("king_safety:    {}", king_safety);
         let a = self.pawn_bonus(friendly_pawns, enemy_pawns, color);
         let b = self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
@@ -2728,7 +2738,7 @@ impl Engine {
         println!("castling:       {}", castling);
         println!(
             "total:          {}",
-            pst_score - hanging + control + king_safety + pawns + bishops + castling
+            pst_score + king_safety + pawns + bishops + castling
         );
         println!("Hash: {}", self.game.hash);
         println!("Hash check: {}", zobrist().hash(&self.game));
