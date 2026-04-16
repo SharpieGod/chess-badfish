@@ -1,6 +1,1 @@
-Captures don't remove the captured piece
-En passant capture doesn't remove the captured pawn (which is on a different square than m.to)
-Castling isn't implemented (rook doesn't move)
-Promotion doesn't change the piece type
-white_turn never toggles
-En passant square isn't set after a double pawn push, and isn't cleared after other moves
+position fen 1k2r3/1p3ppp/3pp3/8/3Pn2b/R3PP1P/4B1PB/6K1 b - - 0 34

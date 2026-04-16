@@ -5,9 +5,9 @@ cutechess-cli \
     option.UCI_LimitStrength=true \
     option.UCI_Elo=1600 \
   -each tc=10+0.1 \
-  -games 6000 \
+  -games 60 \
   -repeat \
   -rounds 20 \
-  -concurrency 10 \
+  -concurrency 4 \
   -resign movecount=5 score=600 \
   -openings file=openings.pgn

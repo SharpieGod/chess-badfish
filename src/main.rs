@@ -2196,14 +2196,15 @@ impl Engine {
             let elapsed = start.elapsed().as_millis();
             let score = self.last_score;
 
-            let score_str = if score >= 900000 {
-                format!("mate {}", depth / 2)
-            } else if score <= -900000 {
-                format!("mate -{}", depth / 2)
+            let score_str = if score > 900_000 {
+                let plies = 1_900_000 - score;
+                format!("mate {}", (plies + 1) / 2)
+            } else if score < -900_000 {
+                let plies = 1_900_000 + score;
+                format!("mate -{}", (plies + 1) / 2)
             } else {
                 format!("cp {}", score)
             };
-
             println!(
                 "info depth {} score {} nodes {} time {}",
                 depth, score_str, self.nodes, elapsed
@@ -2338,13 +2339,14 @@ impl Engine {
 
         if let Some(entry) = self.tt[tt_idx] {
             if entry.hash == hash && entry.depth >= depth {
+                let tt_score = score_from_tt(entry.score, ply);
                 match entry.flag {
-                    TTFlag::Exact => return entry.score,
-                    TTFlag::LowerBound => alpha = alpha.max(entry.score),
-                    TTFlag::UpperBound => beta = beta.min(entry.score),
+                    TTFlag::Exact => return tt_score,
+                    TTFlag::LowerBound => alpha = alpha.max(tt_score),
+                    TTFlag::UpperBound => beta = beta.min(tt_score),
                 }
                 if alpha >= beta {
-                    return entry.score;
+                    return tt_score;
                 }
             }
         }
@@ -2362,8 +2364,7 @@ impl Engine {
         if depth == 0 {
             return self.quiescence(alpha, beta);
         }
-        self.refresh_cache();
-        let static_eval = self.static_eval();
+
         // Null move pruning
 
         if can_null && !in_check && depth >= 3 && beta < 900_000 {
@@ -2447,7 +2448,7 @@ impl Engine {
 
         if moves.is_empty() {
             if in_check {
-                return -(1900000 - depth as i32);
+                return -(1900000 - ply as i32);
             }
             return 0;
         }
@@ -2475,33 +2476,54 @@ impl Engine {
         for (i, m) in moves.iter().enumerate() {
             let u = self.game.make_move(m);
 
-            let score = if i >= 3
-                && depth >= 3
-                && !m.flags.contains(MoveFlags::CAPTURE)
-                && !m.flags.contains(MoveFlags::PROMOTE_Q)
-                && !self.game.board_collection.is_in_check(!color)
-            {
-                // Search at reduced depth first
-                let reduced = -self.negamax(
-                    depth - 2,
-                    -alpha - 1,
-                    -alpha,
-                    start,
-                    deadline,
-                    true,
-                    ply + 1,
-                );
-
-                // If it beats alpha, re-search at full depth
-                if reduced > alpha {
-                    -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, ply + 1)
-                } else {
-                    reduced
-                }
+            let score = if i == 0 {
+                // full search window
+                -self.negamax(depth - 1, -beta, -alpha, start, deadline, can_null, ply + 1)
             } else {
-                -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, ply + 1)
-            };
+                // late move reduction (LMR), look less ahead and tigther
+                let mut score = if i >= 3
+                    && depth >= 3
+                    && !m.flags.contains(MoveFlags::CAPTURE)
+                    && !m.flags.contains(MoveFlags::PROMOTE_Q)
+                    && !self.game.board_collection.is_in_check(!color)
+                {
+                    let r = ((depth as f64).ln() * (i as f64).ln() / 2.0) as u8;
+                    let r = r.max(1);
+                    let reduced_depth = (depth - 1).saturating_sub(r);
 
+                    -self.negamax(
+                        reduced_depth,
+                        -alpha - 1,
+                        -alpha,
+                        start,
+                        deadline,
+                        true,
+                        ply + 1,
+                    )
+                } else {
+                    alpha + 1
+                };
+
+                if score > alpha {
+                    // regular depth but tighter
+                    score = -self.negamax(
+                        depth - 1,
+                        -alpha - 1,
+                        -alpha,
+                        start,
+                        deadline,
+                        true,
+                        ply + 1,
+                    );
+                }
+
+                if score > alpha && score < beta {
+                    // actual full search
+                    score = -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, ply + 1);
+                }
+
+                score
+            };
             self.game.undo_move(&u);
 
             if score >= beta {
@@ -2546,7 +2568,7 @@ impl Engine {
                 self.tt[tt_idx] = Some(TTEntry {
                     hash,
                     depth,
-                    score: score,
+                    score: score_to_tt(score, ply),
                     flag: TTFlag::LowerBound,
                     best_move: Some(*m),
                 });
@@ -2576,7 +2598,7 @@ impl Engine {
         self.tt[tt_idx] = Some(TTEntry {
             hash,
             depth,
-            score: alpha,
+            score: score_to_tt(alpha, ply),
             flag,
             best_move,
         });
@@ -2835,6 +2857,26 @@ impl Engine {
             }
         }
         score as i32
+    }
+}
+
+fn score_to_tt(score: i32, ply: u8) -> i32 {
+    if score > 900_000 {
+        score + ply as i32
+    } else if score < -900_000 {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+fn score_from_tt(score: i32, ply: u8) -> i32 {
+    if score > 900_000 {
+        score - ply as i32
+    } else if score < -900_000 {
+        score + ply as i32
+    } else {
+        score
     }
 }
 
