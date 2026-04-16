@@ -37,15 +37,8 @@ impl TryFrom<usize> for PieceKind {
 }
 
 impl PieceKind {
-    fn value(&self) -> u32 {
-        match self {
-            PieceKind::Pawn => 100,
-            PieceKind::Knight => 300,
-            PieceKind::Bishop => 300,
-            PieceKind::Rook => 500,
-            PieceKind::Queen => 900,
-            PieceKind::King => 0,
-        }
+    fn value(&self) -> i32 {
+        MG_PIECE_VALUES[*self as usize]
     }
 }
 
@@ -271,7 +264,7 @@ impl BitBoardCollection {
             let mut bb = *self.get_board(&piece);
 
             while let Some(index) = bb.pop_lsb() {
-                attacks.0 |= self.piece_attacks(index, piece).0;
+                attacks.0 |= self.piece_attacks(index, &piece).0;
             }
         }
 
@@ -296,7 +289,7 @@ impl BitBoardCollection {
             };
             let mut bb = *self.get_board(&piece);
             while let Some(index) = bb.pop_lsb() {
-                attacks.0 |= self.piece_attacks(index, piece).0;
+                attacks.0 |= self.piece_attacks(index, &piece).0;
             }
         }
 
@@ -476,7 +469,7 @@ impl BitBoardCollection {
         ray
     }
 
-    fn piece_attacks(&self, index: u8, piece: ChessPiece) -> BitBoard {
+    fn piece_attacks(&self, index: u8, piece: &ChessPiece) -> BitBoard {
         match piece.kind {
             PieceKind::Pawn => self.pawn_attacks(index, piece.color),
             PieceKind::Knight => self.knight_attacks(index),
@@ -485,6 +478,22 @@ impl BitBoardCollection {
             PieceKind::Queen => self.bishop_attacks(index) | self.rook_attacks(index),
             PieceKind::King => self.king_attacks(index),
         }
+    }
+
+    fn bishop_attacks_occ(&self, index: u8, occupancy: BitBoard) -> BitBoard {
+        Self::sliding_attacks(index, occupancy, &BISHOP_DIRECTIONS)
+    }
+
+    fn rook_attacks_occ(&self, index: u8, occupancy: BitBoard) -> BitBoard {
+        Self::sliding_attacks(index, occupancy, &ROOK_DIRECTIONS)
+    }
+
+    fn bishop_attacks(&self, index: u8) -> BitBoard {
+        Self::sliding_attacks(index, self.occupied(), &BISHOP_DIRECTIONS)
+    }
+
+    fn rook_attacks(&self, index: u8) -> BitBoard {
+        Self::sliding_attacks(index, self.occupied(), &ROOK_DIRECTIONS)
     }
 
     fn pawn_attacks(&self, index: u8, color: Color) -> BitBoard {
@@ -526,10 +535,10 @@ impl BitBoardCollection {
         attack
     }
 
-    fn rook_attacks(&self, index: u8) -> BitBoard {
+    fn sliding_attacks(index: u8, occupancy: BitBoard, directions: &[(i8, i8)]) -> BitBoard {
         let (file, rank) = BC::decode_tile(index);
         let mut attack = BitBoard(0);
-        for (f, r) in ROOK_DIRECTIONS {
+        for &(f, r) in directions {
             let (mut nf, mut nr) = (file as i8, rank as i8);
             loop {
                 nf += f;
@@ -539,28 +548,7 @@ impl BitBoardCollection {
                 }
                 let tile = BC::encode_tile(nf as u8, nr as u8);
                 attack.0 |= 1 << tile;
-                if self.occupied().contains(tile) {
-                    break;
-                }
-            }
-        }
-        attack
-    }
-
-    fn bishop_attacks(&self, index: u8) -> BitBoard {
-        let (file, rank) = BC::decode_tile(index);
-        let mut attack = BitBoard(0);
-        for (f, r) in BISHOP_DIRECTIONS {
-            let (mut nf, mut nr) = (file as i8, rank as i8);
-            loop {
-                nf += f;
-                nr += r;
-                if !(0..8).contains(&nf) || !(0..8).contains(&nr) {
-                    break;
-                }
-                let tile = BC::encode_tile(nf as u8, nr as u8);
-                attack.0 |= 1 << tile;
-                if self.occupied().contains(tile) {
+                if occupancy.contains(tile) {
                     break;
                 }
             }
@@ -1843,6 +1831,84 @@ impl Engine {
         }
     }
 
+    fn smallest_attacker(
+        &self,
+        index: u8,
+        color: Color,
+        occupancy: BitBoard,
+    ) -> Option<(u8, PieceKind)> {
+        let bc = &self.game.board_collection;
+
+        for k in 0..6usize {
+            let kind = k.try_into().unwrap();
+            let piece = &color.kind(kind);
+            // ignore captured attackers
+            let attackers = BitBoard(bc.get_board(piece).0 & occupancy.0);
+
+            let possible_attacks = match kind {
+                PieceKind::Pawn => bc.pawn_attacks(index, !color),
+                PieceKind::Bishop => bc.bishop_attacks_occ(index, occupancy),
+                PieceKind::Rook => bc.rook_attacks_occ(index, occupancy),
+                PieceKind::Queen => {
+                    bc.bishop_attacks_occ(index, occupancy) | bc.rook_attacks_occ(index, occupancy)
+                }
+                _ => bc.piece_attacks(index, piece),
+            };
+
+            let comb = attackers.0 & possible_attacks.0;
+
+            if comb != 0 {
+                return Some((comb.trailing_zeros() as u8, kind));
+            }
+        }
+
+        None
+    }
+
+    fn see(&self, target_sq: u8, target_value: i32, from_sq: u8, attacker_value: i32) -> i32 {
+        let mut gain = [0i32; 32];
+        let mut d = 0;
+        gain[d] = target_value;
+
+        let mut occupancy = self.game.board_collection.occupied();
+        let mut from = from_sq;
+        let mut attacker_val = attacker_value;
+        let mut side = if self.game.white_turn {
+            Color::Black
+        } else {
+            Color::White
+        };
+        loop {
+            // Remove the previous attacker
+            occupancy.0 &= !(1 << from);
+
+            let next = self.smallest_attacker(target_sq, side, occupancy);
+
+            match next {
+                Some((new_from, new_kind)) => {
+                    d += 1;
+                    gain[d] = attacker_val - gain[d - 1];
+
+                    if gain[d].max(-gain[d - 1]) < 0 {
+                        break;
+                    }
+
+                    from = new_from;
+                    attacker_val = new_kind.value();
+                    side = !side;
+                }
+                None => break,
+            }
+        }
+
+        while d > 0 {
+            gain[d - 1] = -(-gain[d - 1]).max(gain[d]);
+            d -= 1;
+        }
+
+        gain[0]
+    }
+
     fn refresh_cache(&mut self) {
         if self.cache_hash == self.game.hash {
             return; // Nothing to do
@@ -1858,7 +1924,7 @@ impl Engine {
                 let piece = color.kind(kind.try_into().unwrap());
                 let mut bb = *bc.get_board(&piece);
                 while let Some(idx) = bb.pop_lsb() {
-                    let piece_attack = bc.piece_attacks(idx, piece);
+                    let piece_attack = bc.piece_attacks(idx, &piece);
                     attacks.0 |= piece_attack.0;
                 }
             }
@@ -1895,7 +1961,7 @@ impl Engine {
                     // Find cheapest attacker
                     for kind in 0..5usize {
                         let attacker = (!piece.color).kind(kind.try_into().unwrap());
-                        if bc.get_board(&attacker).0 & bc.piece_attacks(sq, attacker).0 != 0 {
+                        if bc.get_board(&attacker).0 & bc.piece_attacks(sq, &attacker).0 != 0 {
                             let attacker_value = MG_PIECE_VALUES[attacker.kind as usize];
                             if attacker_value < piece_value {
                                 penalty += (piece_value - attacker_value) as i32 / 2;
@@ -2615,7 +2681,13 @@ impl Engine {
 
     fn move_score(&self, m: &Move, ply: u8, color: Color) -> i32 {
         if m.flags.contains(MoveFlags::CAPTURE) {
-            return 10000 + self.capture_score(m);
+            let see_value = self.see_for_move(m);
+            // Winning captures > killers, losing captures < quiet history
+            if see_value >= 0 {
+                return 10000 + see_value;
+            } else {
+                return -10000 + see_value; // still ordered among themselves, but below quiets
+            }
         }
         if m.flags.intersects(MoveFlags::PROMOTE_Q) {
             return 9000;
@@ -2630,9 +2702,20 @@ impl Engine {
                 return 7000;
             }
         }
-
         self.history_table[color as usize][m.from as usize][m.to as usize]
     }
+
+    fn see_for_move(&self, m: &Move) -> i32 {
+        if m.flags.contains(MoveFlags::EN_PASSANT) {
+            return 0;
+        }
+
+        let bc = &self.game.board_collection;
+        let target = bc.piece_at_index(m.to).unwrap();
+        let attacker = bc.piece_at_index(m.from).unwrap();
+        self.see(m.to, target.kind.value(), m.from, attacker.kind.value())
+    }
+
     fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
         let hash = self.game.hash;
         let search_count = self.history.get(&hash).copied().unwrap_or(0);
@@ -2666,11 +2749,11 @@ impl Engine {
         let moves = move_gen
             .pseudo_legal_moves(color)
             .into_iter()
-            .filter(|m| m.flags.contains(MoveFlags::CAPTURE) && self.capture_score(m) >= 0)
+            .filter(|m| m.flags.contains(MoveFlags::CAPTURE) && self.see_for_move(m) >= 0)
             .collect::<Vec<_>>();
 
         let mut moves = MoveGen::filter_legal(moves, &mut self.game, color);
-        moves.sort_by_key(|m| -self.capture_score(m));
+        moves.sort_by_key(|m| -self.see_for_move(&m));
 
         for m in moves {
             let u = self.game.make_move(&m);
@@ -2686,32 +2769,6 @@ impl Engine {
         }
 
         alpha
-    }
-
-    fn capture_score(&self, m: &Move) -> i32 {
-        if !m.flags.contains(MoveFlags::CAPTURE) {
-            return 0;
-        }
-        if m.flags.contains(MoveFlags::EN_PASSANT) {
-            return PieceKind::Pawn.value() as i32;
-        }
-
-        let capture = self
-            .game
-            .board_collection
-            .piece_at_index(m.to)
-            .unwrap()
-            .kind
-            .value();
-        let attacker = self
-            .game
-            .board_collection
-            .piece_at_index(m.from)
-            .unwrap()
-            .kind
-            .value();
-
-        capture as i32 - attacker as i32
     }
 
     fn debug_eval(&mut self) {
@@ -2923,6 +2980,7 @@ fn main() {
         if input == "eval" {
             engine.debug_eval();
         }
+
         if input.starts_with("go perft") {
             let track = Instant::now();
             let n = input.split_whitespace().collect::<Vec<&str>>()[2]

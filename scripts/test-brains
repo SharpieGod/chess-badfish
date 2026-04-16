@@ -1,7 +1,9 @@
 #!/bin/bash
+cargo build --release
+
 cutechess-cli \
   -engine cmd=./target/release/chess-badfish name=Newest proto=uci \
-  -engine cmd=./saved-brains/v2 name=BadFish2 proto=uci \
+  -engine cmd=./saved-brains/v9 name=BadFish9 proto=uci \
   -each tc=10+0.1 \
   -games 2 \
   -rounds 5000 \

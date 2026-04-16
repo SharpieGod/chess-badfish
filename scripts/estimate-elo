@@ -1,13 +1,16 @@
 #!/bin/bash
+cargo build --release
+
 cutechess-cli \
   -engine cmd=./target/release/chess-badfish name=BadFish proto=uci \
   -engine cmd=stockfish name=SF proto=uci \
     option.UCI_LimitStrength=true \
     option.UCI_Elo=1600 \
-  -each tc=10+0.1 \
-  -games 60 \
+  -each tc=30+0.1 \
+  -games 800 \
   -repeat \
-  -rounds 20 \
+  -rounds 200 \
   -concurrency 4 \
-  -resign movecount=5 score=600 \
-  -openings file=openings.pgn
+  -resign movecount=10 score=800 \
+  -draw movenumber=50 movecount=8 score=20 \
+  -openings file=openings.pgn order=random
