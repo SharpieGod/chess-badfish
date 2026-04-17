@@ -1976,7 +1976,14 @@ impl Engine {
         penalty
     }
 
-    fn king_safety(&self, king_sq: u8, friendly_pieces: BitBoard, enemy_attacks: BitBoard) -> i32 {
+    fn king_safety(&self, color: Color) -> i32 {
+        let bc = &self.game.board_collection;
+        let king_sq = bc
+            .get_board(&color.kind(PieceKind::King))
+            .0
+            .trailing_zeros() as u8;
+        let (king_file, king_rank) = BC::decode_tile(king_sq);
+
         let mut around = BitBoard(0);
         let (file, rank) = BC::decode_tile(king_sq);
         for (df, dr) in KING_DIRECTIONS {
@@ -1986,10 +1993,85 @@ impl Engine {
             }
         }
 
-        let safe_defenders = (around & friendly_pieces & !enemy_attacks).0.count_ones() as i32;
-        let attacked_empty = (around & !friendly_pieces & enemy_attacks).0.count_ones() as i32;
+        let mut attack_units = 0i32;
+        let mut attacker_count = 0;
+        let enemy = !color;
 
-        safe_defenders * 4 - attacked_empty * 8
+        for kind in 1..5usize {
+            let piece = enemy.kind(kind.try_into().unwrap());
+            let mut bb = *bc.get_board(&piece);
+
+            while let Some(sq) = bb.pop_lsb() {
+                let attack = bc.piece_attacks(sq, &piece);
+                let zone_attacks = attack.0 & around.0;
+
+                if zone_attacks != 0 {
+                    attacker_count += 1;
+                    let num_attacked = zone_attacks.count_ones() as i32;
+                    attack_units += ATTACK_WEIGHTS[kind] * num_attacked
+                }
+            }
+        }
+
+        let friendly_pawns = bc.get_board(&color.kind(PieceKind::Pawn)).0;
+        let mut shield_bonus = 0i32;
+
+        for df in -1..=1i8 {
+            let f = king_file as i8 + df;
+            if !(0..8).contains(&f) {
+                continue;
+            }
+
+            let forward_rank = if color == Color::White {
+                king_rank + 1
+            } else {
+                king_rank.wrapping_sub(1)
+            };
+
+            if forward_rank < 8 {
+                let shield_sq = BC::encode_tile(f as u8, forward_rank);
+                if friendly_pawns & (1 << shield_sq) != 0 {
+                    shield_bonus += 15; // pawn directly shielding
+                } else {
+                    let far_rank = if color == Color::White {
+                        king_rank + 2
+                    } else {
+                        king_rank.wrapping_sub(2)
+                    };
+
+                    if far_rank < 8 {
+                        let far_sq = BC::encode_tile(f as u8, far_rank);
+                        if friendly_pawns & (1 << far_sq) != 0 {
+                            shield_bonus += 5; // pawn shield but advanced
+                        } else {
+                            shield_bonus -= 15; // no pawn cover at all
+                        }
+                    }
+                }
+            }
+        }
+
+        let file_mask: u64 = 0x0101010101010101;
+        let all_pawns = bc.get_board(&Color::White.kind(PieceKind::Pawn)).0
+            | bc.get_board(&Color::Black.kind(PieceKind::Pawn)).0;
+        let mut open_file_penalty = 0i32;
+
+        for df in -1..=1i8 {
+            let f = king_file as i8 + df;
+            if !(0..8).contains(&f) {
+                continue;
+            }
+            if all_pawns & (file_mask << f) == 0 {
+                open_file_penalty += 20; // fully open file near king
+            } else if friendly_pawns & (file_mask << f as u8) == 0 {
+                open_file_penalty += 10; // semi-open (no friendly pawn)
+            }
+        }
+        let safety_table_index = (attack_units as usize).min(99);
+        let attack_score = SAFETY_TABLE[safety_table_index];
+        let attack_penalty = if attacker_count >= 2 { attack_score } else { 0 };
+
+        shield_bonus - attack_penalty - open_file_penalty
     }
 
     fn static_eval(&self) -> i32 {
@@ -1999,17 +2081,10 @@ impl Engine {
             Color::Black
         };
         let bc = &self.game.board_collection;
-        let friendly_attacks = self.cached_attacks[color as usize];
-        let enemy_attacks = self.cached_attacks[(!color) as usize];
-
-        let friendly_pieces = bc.occupied_color(color);
-        let enemy_pieces = bc.occupied_color(!color);
 
         let mut mg = [0; 2];
         let mut eg = [0; 2];
         let mut game_phase = 0i32;
-        let mut white_king_sq = 0;
-        let mut black_king_sq = 0;
 
         let mut friendly_bishops = 0;
         let mut enemy_bishops = 0;
@@ -2032,14 +2107,6 @@ impl Engine {
                     PieceKind::Queen => (MG_QUEEN_TABLE[table_sq], EG_QUEEN_TABLE[table_sq]),
                     PieceKind::King => (MG_KING_TABLE[table_sq], EG_KING_TABLE[table_sq]),
                 };
-
-                if piece.kind == PieceKind::King {
-                    if piece.color == Color::White {
-                        white_king_sq = sq;
-                    } else {
-                        black_king_sq = sq;
-                    }
-                }
 
                 if piece.kind == PieceKind::Bishop {
                     if piece.color == color {
@@ -2069,17 +2136,6 @@ impl Engine {
         //     - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
         let hanging = 0;
 
-        let king_sq = if self.game.white_turn {
-            white_king_sq
-        } else {
-            black_king_sq
-        };
-        let enemy_king_sq = if self.game.white_turn {
-            black_king_sq
-        } else {
-            white_king_sq
-        };
-
         let friendly_pawns = *self
             .game
             .board_collection
@@ -2095,10 +2151,7 @@ impl Engine {
 
         let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);
 
-        let king_safety = (self.king_safety(king_sq, friendly_pieces, enemy_attacks)
-            - self.king_safety(enemy_king_sq, enemy_pieces, friendly_attacks))
-            * mg_phase
-            / 24;
+        let king_safety = (self.king_safety(color) - self.king_safety(!color)) * mg_phase / 24;
 
         let castling_rights_bonus = {
             let our_rights = if self.game.white_turn {
@@ -2114,11 +2167,94 @@ impl Engine {
             (our_rights - their_rights) * 20
         };
 
+        let file_mask: u64 = 0x0101010101010101;
+        let all_pawns = friendly_pawns.0 | enemy_pawns.0;
+
+        let mut rook_bonus = 0i32;
+
+        // Friendly rooks
+        let mut friendly_rooks = *bc.get_board(&color.kind(PieceKind::Rook));
+        while let Some(sq) = friendly_rooks.pop_lsb() {
+            let (file, rank) = BC::decode_tile(sq);
+            let file_bb = file_mask << file;
+
+            if file_bb & all_pawns == 0 {
+                rook_bonus += 20; // open file
+            } else if file_bb & friendly_pawns.0 == 0 {
+                rook_bonus += 10; // semi-open
+            }
+
+            // 7th rank bonus
+            let seventh = if color == Color::White { 6 } else { 1 };
+            if rank == seventh {
+                rook_bonus += 20;
+            }
+        }
+
+        // Enemy rooks
+        let mut enemy_rooks = *bc.get_board(&(!color).kind(PieceKind::Rook));
+        while let Some(sq) = enemy_rooks.pop_lsb() {
+            let (file, rank) = BC::decode_tile(sq);
+            let file_bb = file_mask << file;
+
+            if file_bb & all_pawns == 0 {
+                rook_bonus -= 20;
+            } else if file_bb & enemy_pawns.0 == 0 {
+                rook_bonus -= 10;
+            }
+
+            let seventh = if color == Color::White { 1 } else { 6 };
+            if rank == seventh {
+                rook_bonus -= 20;
+            }
+        }
+
         (mg_score * mg_phase + eg_score * eg_phase) / 24 - hanging
             + king_safety
             + bishops
             + castling_rights_bonus
             + pawns
+            + self.mobility_bonus()
+            + rook_bonus
+    }
+
+    fn mobility_bonus(&self) -> i32 {
+        let bc = &self.game.board_collection;
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+
+        let mut score = 0i32;
+
+        let weights = [4, 3, 2, 1]; // knight mobility matters most per-square
+
+        for (kind_idx, &weight) in [1usize, 2, 3, 4].iter().zip(weights.iter()) {
+            let kind: PieceKind = (*kind_idx).try_into().unwrap();
+
+            // Friendly mobility
+            let piece = color.kind(kind);
+            let mut bb = *bc.get_board(&piece);
+            let friendly_occ = bc.occupied_color(color);
+            while let Some(sq) = bb.pop_lsb() {
+                let attacks = bc.piece_attacks(sq, &piece);
+                let moves = (attacks & !friendly_occ).0.count_ones() as i32;
+                score += weight * moves;
+            }
+
+            // Enemy mobility (subtract)
+            let enemy_piece = (!color).kind(kind);
+            let mut bb = *bc.get_board(&enemy_piece);
+            let enemy_occ = bc.occupied_color(!color);
+            while let Some(sq) = bb.pop_lsb() {
+                let attacks = bc.piece_attacks(sq, &enemy_piece);
+                let moves = (attacks & !enemy_occ).0.count_ones() as i32;
+                score -= weight * moves;
+            }
+        }
+
+        score
     }
 
     fn pawn_bonus(&self, friendly_pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
@@ -2866,10 +3002,7 @@ impl Engine {
         let hanging = self.hanging_penalty(enemy_attacks, friendly_attacks, friendly_pieces)
             - self.hanging_penalty(friendly_attacks, enemy_attacks, enemy_pieces);
 
-        let king_safety = (self.king_safety(king_sq, friendly_pieces, enemy_attacks)
-            - self.king_safety(enemy_king_sq, enemy_pieces, friendly_attacks))
-            * mg_phase
-            / 24;
+        let king_safety = (self.king_safety(color) - self.king_safety(!color)) * mg_phase / 24;
         let pawns = self.pawn_bonus(friendly_pawns, enemy_pawns, color)
             - self.pawn_bonus(enemy_pawns, friendly_pawns, !color);
         let bishops = self.bishop_bonus(friendly_bishops) - self.bishop_bonus(enemy_bishops);

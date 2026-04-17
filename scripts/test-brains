@@ -1,22 +1,9 @@
 #!/bin/bash
 cargo build --release
-cutechess-cli \
-  -engine cmd=./target/release/chess-badfish name=New proto=uci \
-  -engine cmd=./saved-brains/v5 name=Old proto=uci \
-  -each tc=10+0.1 \
-  -games 2 \
-  -rounds 2500 \
-  -repeat \
-  -concurrency 6 \
-  -resign movecount=5 score=600 \
-  -draw movenumber=40 movecount=8 score=10 \
-  -openings file=openings.pgn order=random \
-  -sprt elo0=0 elo1=5 alpha=0.05 beta=0.05 \
-  -pgnout v5vsnew.pgn
 
 cutechess-cli \
   -engine cmd=./target/release/chess-badfish name=New proto=uci \
-  -engine cmd=./saved-brains/v9 name=Old proto=uci \
+  -engine cmd=./saved-brains/v10 name=Old proto=uci \
   -each tc=10+0.1 \
   -games 2 \
   -rounds 2500 \
