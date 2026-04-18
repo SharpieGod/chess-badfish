@@ -59,6 +59,10 @@ fn main() {
             println!("readyok");
         }
 
+        if input.starts_with("setoption") {
+            // ignore for now
+        }
+
         if input == "stop" {
             engine.stop.store(true, Ordering::Relaxed);
             if let Some(t) = search_thread.take() {
