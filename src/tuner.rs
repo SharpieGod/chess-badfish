@@ -375,7 +375,7 @@ pub fn tune() {
     let eps = 1.0f64;
     let n_params = adam.params.len();
 
-    for epoch in 0..50_000 {
+    for epoch in 0..2_000 {
         // Compute numerical gradient in parallel across params
         let base_loss = total_loss(&positions, &adam.params, k);
 

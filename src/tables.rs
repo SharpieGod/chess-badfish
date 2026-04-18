@@ -73,7 +73,6 @@ pub const EG_KING_TABLE: [i32; 64] = [
 ];
 
 pub const GAMEPHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0]; // pawn, knight, bishop, rook, queen, king
-pub const PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 10, 20, 35, 55, 80, 120];
 
 pub const ATTACK_WEIGHTS: [i32; 6] = [0, 2, 2, 3, 5, 0]; // pawn, knight, bishop, rook, queen, king
 pub const SAFETY_GROWTH_FACTOR: i32 = 10;
@@ -92,19 +91,18 @@ pub const SAFETY_TABLE: [i32; 100] = {
 pub const MG_PIECE_VALUES: [i32; 6] = [82, 337, 365, 477, 1025, 0]; // P N B R Q K
 pub const EG_PIECE_VALUES: [i32; 6] = [94, 281, 297, 512, 936, 0];
 
-pub const PS_NO_COVER: i32 = -15;
-pub const PS_FULL_COVER: i32 = 15;
-pub const PS_PART_COVER: i32 = 5;
-
-pub const OPEN_FILE_PENALTY: i32 = 20;
-pub const SEMI_OPEN_FILE_PENALTY: i32 = 10;
-
-pub const BISHOP_BONUS: i32 = 30;
-pub const ISOLATED_PAWN_PENALTY: i32 = -15;
-pub const DOUBLED_PAWNS_PENALTY: i32 = -20;
+pub const PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 0, 2, 44, 109, 193, 119];
+pub const ISOLATED_PAWN_PENALTY: i32 = -12;
+pub const DOUBLED_PAWNS_PENALTY: i32 = -27;
+pub const BISHOP_BONUS: i32 = 54;
 pub const CASTLING_RIGHTS_BONUS: i32 = 20;
-pub const ROOK_OPEN_FILE_BONUS: i32 = 20;
-pub const ROOK_SEMI_OPEN_FILE_BONUS: i32 = 10;
-pub const ROOK_SEVENTH_RANK_BONUS: i32 = 20;
-pub const MOBILITY_BONUS: [i32; 4] = [4, 3, 2, 1];
+pub const ROOK_OPEN_FILE_BONUS: i32 = 34;
+pub const ROOK_SEMI_OPEN_FILE_BONUS: i32 = 24;
+pub const ROOK_SEVENTH_RANK_BONUS: i32 = 46;
+pub const MOBILITY_BONUS: [i32; 4] = [10, 7, 4, 4];
+pub const PS_FULL_COVER: i32 = 30;
+pub const PS_PART_COVER: i32 = 10;
+pub const PS_NO_COVER: i32 = -15;
+pub const OPEN_FILE_PENALTY: i32 = 53;
+pub const SEMI_OPEN_FILE_PENALTY: i32 = 28;
 pub const ATTACKER_THRESHOLD: i32 = 2;
