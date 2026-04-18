@@ -1,5 +1,11 @@
 use std::fs;
 
+use crate::{
+    START_POS,
+    board::{Color, Game},
+    movegen::MoveGen,
+};
+
 pub fn parse_pgn() {
     let raw = fs::read_to_string("13kgames.pgn")
         .expect("Error reading games")
@@ -66,7 +72,40 @@ pub fn parse_pgn() {
             _ => -9999f32,
         };
 
-        // println!("{:?} {}", tokens, turnout);
+        let mut game = Game::from_fen(START_POS);
+        let mut seen = 0;
+
+        for (idx, t) in tokens.iter().enumerate() {
+            let mv = match game.from_san(*t) {
+                Some(mv) => mv,
+                None => break,
+            };
+
+            game.make_move(&mv);
+
+            let color = if game.white_turn {
+                Color::White
+            } else {
+                Color::Black
+            };
+
+            // skip positions in check
+            if t.contains('+') || t.contains('#') || game.board_collection.is_in_check(color) {
+                continue;
+            }
+
+            seen += 1;
+
+            if seen > 10 && seen % 3 == 0 {
+                let outcome = if game.white_turn {
+                    turnout
+                } else {
+                    1.0 - turnout
+                };
+
+                println!("{} | {}", game.into_fen(), outcome);
+            }
+        }
 
         i = l;
     }

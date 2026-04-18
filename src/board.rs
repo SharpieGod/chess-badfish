@@ -1,4 +1,5 @@
 use crate::consts::*;
+use crate::movegen::MoveGen;
 use crate::tables::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -501,8 +502,9 @@ impl BitBoardCollection {
         let left = index as i16 - 1 + forward;
         let right = index as i16 + 1 + forward;
 
-        attacks.0 |= 1u64 << left;
-        if file > 0 && left >= 0 && left < 64 {}
+        if file > 0 && left >= 0 && left < 64 {
+            attacks.0 |= 1u64 << left;
+        }
         if file < 7 && right >= 0 && right < 64 {
             attacks.0 |= 1u64 << right;
         }
@@ -798,6 +800,120 @@ pub struct Game {
 }
 
 impl Game {
+    pub fn from_san(&mut self, san: &str) -> Option<Move> {
+        let san = san.trim_end_matches(|c| c == '+' || c == '#' || c == '!' || c == '?');
+        let color = if self.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+
+        if san == "O-O" || san == "O-O-O" {
+            let move_gen = MoveGen::new(self);
+            let pseudo = move_gen.pseudo_legal_moves(color);
+            let legal = MoveGen::filter_legal(pseudo, self, color);
+            let flag = if san == "O-O" {
+                MoveFlags::CASTLE_KING
+            } else {
+                MoveFlags::CASTLE_QUEEN
+            };
+
+            return legal.into_iter().find(|m| m.flags.contains(flag));
+        }
+
+        let bytes = san.as_bytes();
+        let is_capture = san.contains('x');
+        let clean: String = san.chars().filter(|&c| c != 'x').collect();
+        let bytes = clean.as_bytes();
+        let (piece_kind, rest) = if bytes[0].is_ascii_uppercase() {
+            let kind = match bytes[0] {
+                b'N' => PieceKind::Knight,
+                b'B' => PieceKind::Bishop,
+                b'R' => PieceKind::Rook,
+                b'Q' => PieceKind::Queen,
+                b'K' => PieceKind::King,
+                _ => return None,
+            };
+            (kind, &bytes[1..])
+        } else {
+            (PieceKind::Pawn, &bytes[..])
+        };
+
+        let (rest, promo) = if let Some(pos) = clean.find('=') {
+            let promo_kind = match clean.as_bytes()[pos + 1] {
+                b'Q' => MoveFlags::PROMOTE_Q,
+                b'R' => MoveFlags::PROMOTE_R,
+                b'N' => MoveFlags::PROMOTE_N,
+                b'B' => MoveFlags::PROMOTE_B,
+                _ => return None,
+            };
+            (&rest[..rest.len() - 2], Some(promo_kind))
+        } else {
+            (rest, None)
+        };
+
+        if rest.len() < 2 {
+            return None;
+        }
+
+        let dest_file = rest[rest.len() - 2] - b'a';
+        let dest_rank = rest[rest.len() - 1] - b'1';
+        let to = BC::encode_tile(dest_file, dest_rank);
+
+        // Disambiguation
+        let disambig = &rest[..rest.len() - 2];
+
+        let disambig_file: Option<u8> = disambig
+            .iter()
+            .find(|&&c| c >= b'a' && c <= b'h')
+            .map(|&c| c - b'a');
+        let disambig_rank: Option<u8> = disambig
+            .iter()
+            .find(|&&c| c >= b'1' && c <= b'8')
+            .map(|&c| c - b'1');
+
+        let move_gen = MoveGen::new(self);
+        let pseudo = move_gen.pseudo_legal_moves(color);
+        let legal = MoveGen::filter_legal(pseudo, self, color);
+
+        legal.into_iter().find(|m| {
+            // Must land on correct square
+            if m.to != to {
+                return false;
+            }
+
+            // Must be correct piece
+            let piece = self.board_collection.piece_at_index(m.from);
+            match piece {
+                Some(p) if p.kind == piece_kind && p.color == color => {}
+                _ => return false,
+            }
+
+            // Check disambiguation
+            let (from_file, from_rank) = BC::decode_tile(m.from);
+            if let Some(df) = disambig_file {
+                if from_file != df {
+                    return false;
+                }
+            }
+            if let Some(dr) = disambig_rank {
+                if from_rank != dr {
+                    return false;
+                }
+            }
+
+            // Check promotion
+            match promo {
+                Some(flag) => m.flags.contains(flag),
+                None => !m.flags.intersects(
+                    MoveFlags::PROMOTE_Q
+                        | MoveFlags::PROMOTE_R
+                        | MoveFlags::PROMOTE_N
+                        | MoveFlags::PROMOTE_B,
+                ),
+            }
+        })
+    }
     pub fn from_fen(fen: &str) -> Self {
         let fen_string = String::from(fen);
 

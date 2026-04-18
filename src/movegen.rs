@@ -309,6 +309,7 @@ impl<'a> MoveGen<'a> {
         // King cant move to an attacked square
         self.game.board_collection.king_attacks(index) & !(self.attacks_by(!color)) & !self.occupied
     }
+
     pub fn king_castling_moves(&self, index: u8, color: Color, king_side: bool) -> BitBoard {
         let is_white = color == Color::White;
         let comb_index = is_white as usize * 2 + king_side as usize;
@@ -322,12 +323,16 @@ impl<'a> MoveGen<'a> {
         let empty = [BLACK_Q_EMPTY, BLACK_K_EMPTY, WHITE_Q_EMPTY, WHITE_K_EMPTY][comb_index];
         let safe = [BLACK_Q_SAFE, BLACK_K_SAFE, WHITE_Q_SAFE, WHITE_K_SAFE][comb_index];
 
-        let attacks = self.attacks_by(!color);
-        let occupied = self.occupied;
-        let target = if king_side { index + 2 } else { index - 2 };
+        if rights {
+            let attacks = self.attacks_by(!color);
+            let occupied = self.occupied;
+            let target = if king_side { index + 2 } else { index - 2 };
 
-        if rights && (safe & attacks.0) == 0 && (empty & occupied.0) == 0 {
-            BitBoard(1 << target)
+            if (safe & attacks.0) == 0 && (empty & occupied.0) == 0 {
+                BitBoard(1 << target)
+            } else {
+                BitBoard(0)
+            }
         } else {
             BitBoard(0)
         }
