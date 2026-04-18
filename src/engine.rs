@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::movegen::*;
+use crate::tuner::Trace;
 use crate::{START_POS, consts::*};
 use crate::{board::*, tables::*};
 
@@ -54,6 +55,251 @@ impl Engine {
             killers: [[None; 2]; 64],
             history_table: [[[0; 64]; 64]; 2],
         }
+    }
+
+    pub fn trace_eval(&self) -> Trace {
+        // Claude parsed my Engine::static_eval same logic, just not adding numbers but incerementing counter
+        let mut trace = Trace::default();
+
+        let color = if self.game.white_turn {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let bc = &self.game.board_collection;
+
+        // ------------------------------------------------------------------ //
+        //  Piece values + game phase                                           //
+        // ------------------------------------------------------------------ //
+        for sq in 0..64u8 {
+            if let Some(piece) = bc.piece_at_index(sq) {
+                let c = piece.color as usize;
+                let kind_idx = piece.kind as usize;
+
+                if kind_idx < 5 {
+                    trace.piece_values[c][kind_idx] += 1;
+                }
+
+                trace.phase += GAMEPHASE_INC[kind_idx];
+            }
+        }
+        trace.phase = trace.phase.min(24);
+
+        // ------------------------------------------------------------------ //
+        //  Pawn structure                                                      //
+        // ------------------------------------------------------------------ //
+        let file_mask: u64 = 0x0101010101010101;
+
+        for c in 0..2usize {
+            let pcolor = Color::try_from(c).unwrap();
+            let friendly_pawns = *bc.get_board(&pcolor.kind(PieceKind::Pawn));
+            let enemy_pawns = *bc.get_board(&(!pcolor).kind(PieceKind::Pawn));
+
+            let mut pawns_bb = friendly_pawns;
+            while let Some(sq) = pawns_bb.pop_lsb() {
+                let (file, rank) = BC::decode_tile(sq);
+
+                // Passed pawn
+                let mut scan_mask = file_mask << file;
+                if file > 0 {
+                    scan_mask |= file_mask << (file - 1);
+                }
+                if file < 7 {
+                    scan_mask |= file_mask << (file + 1);
+                }
+                if pcolor == Color::White {
+                    scan_mask &= !0u64 << (rank * 8);
+                } else {
+                    scan_mask &= (1u64 << (rank * 8)).wrapping_sub(1);
+                }
+                if scan_mask & enemy_pawns.0 == 0 {
+                    let bonus_rank = if pcolor == Color::White {
+                        rank
+                    } else {
+                        7 - rank
+                    };
+                    trace.passed_pawns[c][bonus_rank as usize] += 1;
+                }
+
+                // Isolated pawn
+                let adj_mask = {
+                    let mut m = 0u64;
+                    if file > 0 {
+                        m |= file_mask << (file - 1);
+                    }
+                    if file < 7 {
+                        m |= file_mask << (file + 1);
+                    }
+                    m
+                };
+                if adj_mask & friendly_pawns.0 == 0 {
+                    trace.isolated_pawns[c] += 1;
+                }
+            }
+
+            // Doubled pawns
+            for file in 0..8u8 {
+                let count = (file_mask << file & friendly_pawns.0).count_ones();
+                if count > 1 {
+                    trace.doubled_pawns[c] += (count - 1) as i8;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        //  Bishop pair                                                         //
+        // ------------------------------------------------------------------ //
+        for c in 0..2usize {
+            let pcolor = Color::try_from(c).unwrap();
+            let bishop_count = bc.get_board(&pcolor.kind(PieceKind::Bishop)).0.count_ones();
+            if bishop_count >= 2 {
+                trace.bishop_pair[c] += 1;
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        //  Castling rights                                                     //
+        // ------------------------------------------------------------------ //
+        trace.castling_rights[0] = (self.game.k_white as i8) + (self.game.q_white as i8);
+        trace.castling_rights[1] = (self.game.k_black as i8) + (self.game.q_black as i8);
+
+        // ------------------------------------------------------------------ //
+        //  Rook bonuses                                                        //
+        // ------------------------------------------------------------------ //
+        let all_pawns = bc.get_board(&Color::White.kind(PieceKind::Pawn)).0
+            | bc.get_board(&Color::Black.kind(PieceKind::Pawn)).0;
+
+        for c in 0..2usize {
+            let pcolor = Color::try_from(c).unwrap();
+            let friendly_pawns = bc.get_board(&pcolor.kind(PieceKind::Pawn)).0;
+            let mut rooks = *bc.get_board(&pcolor.kind(PieceKind::Rook));
+
+            while let Some(sq) = rooks.pop_lsb() {
+                let (file, rank) = BC::decode_tile(sq);
+                let file_bb = file_mask << file;
+
+                if file_bb & all_pawns == 0 {
+                    trace.rook_open_file[c] += 1;
+                } else if file_bb & friendly_pawns == 0 {
+                    trace.rook_semi_open_file[c] += 1;
+                }
+
+                let seventh = if pcolor == Color::White { 6u8 } else { 1u8 };
+                if rank == seventh {
+                    trace.rook_seventh_rank[c] += 1;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        //  King safety                                                         //
+        // ------------------------------------------------------------------ //
+        for c in 0..2usize {
+            let pcolor = Color::try_from(c).unwrap();
+            let enemy = !pcolor;
+            let king_bb = bc.get_board(&pcolor.kind(PieceKind::King)).0;
+            let king_sq = king_bb.trailing_zeros() as u8;
+            let (king_file, king_rank) = BC::decode_tile(king_sq);
+            let friendly_pawns = bc.get_board(&pcolor.kind(PieceKind::Pawn)).0;
+
+            let mut around = BitBoard(0);
+            for (df, dr) in KING_DIRECTIONS {
+                let (nf, nr) = (king_file as i8 + df, king_rank as i8 + dr);
+                if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                    around.0 |= 1 << BC::encode_tile(nf as u8, nr as u8);
+                }
+            }
+
+            // Attack units
+            let mut attack_units = 0i16;
+            let mut attacker_count = 0i8;
+            for kind in 1..5usize {
+                let piece = enemy.kind(kind.try_into().unwrap());
+                let mut bb = *bc.get_board(&piece);
+                while let Some(sq) = bb.pop_lsb() {
+                    let attack = bc.piece_attacks(sq, &piece);
+                    let zone_attacks = attack.0 & around.0;
+                    if zone_attacks != 0 {
+                        attacker_count += 1;
+                        let num_attacked = zone_attacks.count_ones() as i16;
+                        attack_units += ATTACK_WEIGHTS[kind] as i16 * num_attacked;
+                    }
+                }
+            }
+            trace.attack_units[c] = attack_units.min(99) as i8;
+            trace.attacker_count[c] = attacker_count;
+
+            // Pawn shield
+            for df in -1i8..=1 {
+                let f = king_file as i8 + df;
+                if !(0..8).contains(&f) {
+                    continue;
+                }
+                let forward_rank = if pcolor == Color::White {
+                    king_rank + 1
+                } else {
+                    king_rank.wrapping_sub(1)
+                };
+                if forward_rank >= 8 {
+                    continue;
+                }
+                let shield_sq = BC::encode_tile(f as u8, forward_rank);
+                if friendly_pawns & (1 << shield_sq) != 0 {
+                    trace.ps_full_cover[c] += 1;
+                } else {
+                    let far_rank = if pcolor == Color::White {
+                        king_rank + 2
+                    } else {
+                        king_rank.wrapping_sub(2)
+                    };
+                    if far_rank < 8 {
+                        let far_sq = BC::encode_tile(f as u8, far_rank);
+                        if friendly_pawns & (1 << far_sq) != 0 {
+                            trace.ps_part_cover[c] += 1;
+                        } else {
+                            trace.ps_no_cover[c] += 1;
+                        }
+                    }
+                }
+            }
+
+            // Open/semi-open files near king
+            for df in -1i8..=1 {
+                let f = king_file as i8 + df;
+                if !(0..8).contains(&f) {
+                    continue;
+                }
+                let col = file_mask << f as u8;
+                if col & all_pawns == 0 {
+                    trace.open_file_penalty[c] += 1;
+                } else if col & friendly_pawns == 0 {
+                    trace.semi_open_file_penalty[c] += 1;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        //  Mobility                                                            //
+        // ------------------------------------------------------------------ //
+        // indices: 0=Knight 1=Bishop 2=Rook 3=Queen  (matches MOBILITY_BONUS)
+        for c in 0..2usize {
+            let pcolor = Color::try_from(c).unwrap();
+            let friendly_occ = bc.occupied_color(pcolor);
+
+            for (mob_idx, kind_idx) in [1usize, 2, 3, 4].iter().enumerate() {
+                let kind: PieceKind = (*kind_idx).try_into().unwrap();
+                let piece = pcolor.kind(kind);
+                let mut bb = *bc.get_board(&piece);
+
+                while let Some(sq) = bb.pop_lsb() {
+                    let attacks = bc.piece_attacks(sq, &piece);
+                    let moves = (attacks & !friendly_occ).0.count_ones();
+                    trace.mobility[c][mob_idx] += moves as i8;
+                }
+            }
+        }
+
+        trace
     }
 
     pub fn smallest_attacker(
@@ -292,6 +538,7 @@ impl Engine {
                 open_file_penalty += SEMI_OPEN_FILE_PENALTY; // semi-open (no friendly pawn)
             }
         }
+
         let safety_table_index = (attack_units as usize).min(99);
         let attack_score = SAFETY_TABLE[safety_table_index];
         let attack_penalty = if attacker_count >= ATTACKER_THRESHOLD {
