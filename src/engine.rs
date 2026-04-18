@@ -288,7 +288,7 @@ impl Engine {
             }
             if all_pawns & (file_mask << f) == 0 {
                 open_file_penalty += OPEN_FILE_PENALTY; // fully open file near king
-            } else if friendly_pawns & (file_mask << f as u8) == 0 {
+            } else if friendly_pawns & (file_mask << f) == 0 {
                 open_file_penalty += SEMI_OPEN_FILE_PENALTY; // semi-open (no friendly pawn)
             }
         }
@@ -530,14 +530,14 @@ impl Engine {
             };
 
             if adjacent_file_mask & friendly_pawns.0 == 0 {
-                bonus -= ISOLATED_PAWN_PENALTY;
+                bonus += ISOLATED_PAWN_PENALTY;
             }
         }
 
         for file in 0..8 {
             let pawns_on_file = (file_mask << file & friendly_pawns.0).count_ones();
             if pawns_on_file > 1 {
-                bonus -= DOUBLED_PAWNS_PENALTY * (pawns_on_file - 1) as i32;
+                bonus += DOUBLED_PAWNS_PENALTY * (pawns_on_file - 1) as i32;
             }
         }
 

@@ -3,7 +3,9 @@ mod consts;
 mod engine;
 mod movegen;
 mod parse_pgn;
+mod stockfish;
 mod tables;
+mod tuner;
 
 use board::*;
 use engine::*;
