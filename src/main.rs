@@ -12,6 +12,8 @@ use engine::*;
 use movegen::*;
 use parse_pgn::*;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::sync::atomic::Ordering;
+use std::thread;
 use std::{collections::HashMap, i32, io, mem, sync::OnceLock, time::Instant};
 use tables::*;
 use tables::*;
@@ -35,12 +37,14 @@ fn take_input() -> String {
 const START_POS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 fn main() {
     // parse_pgn();
-    tune();
+    // tune();
 
     let mut engine = Engine::new();
+    let mut search_thread: Option<thread::JoinHandle<()>> = None;
 
     loop {
         let input = take_input();
+
         if input == "quit" {
             std::process::exit(0);
         }
@@ -56,10 +60,17 @@ fn main() {
         }
 
         if input == "stop" {
-            engine.stop = true;
+            engine.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = search_thread.take() {
+                let _ = t.join();
+            }
         }
 
         if input == "ucinewgame" {
+            engine.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = search_thread.take() {
+                let _ = t.join();
+            }
             engine = Engine::new();
         }
 
@@ -81,7 +92,12 @@ fn main() {
         }
 
         if input.starts_with("go") {
-            engine.stop = false;
+            engine.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = search_thread.take() {
+                let _ = t.join();
+            }
+            engine.stop.store(false, Ordering::Relaxed);
+
             let parts = input.split_whitespace().collect::<Vec<&str>>();
             let depth = if parts.len() > 2 && parts[1] == "depth" {
                 parts[2].parse::<u8>().unwrap_or(4)
@@ -103,23 +119,26 @@ fn main() {
             .map(|t| t / 20) // use 1/20th of remaining time per move
             .unwrap_or(5000);
 
-            if let Some(mv) = engine.search(depth, time_ms) {
-                let mut mv_s = BC::encode_notation(mv.from);
-                mv_s.extend(BC::encode_notation(mv.to).chars());
-                let promo = if mv.flags.contains(MoveFlags::PROMOTE_Q) {
-                    "q"
-                } else if mv.flags.contains(MoveFlags::PROMOTE_R) {
-                    "r"
-                } else if mv.flags.contains(MoveFlags::PROMOTE_N) {
-                    "n"
-                } else if mv.flags.contains(MoveFlags::PROMOTE_B) {
-                    "b"
-                } else {
-                    ""
-                };
+            let mut search_engine = engine.clone();
 
-                println!("bestmove {}{}", mv_s, promo);
-            }
+            search_thread = Some(thread::spawn(move || {
+                if let Some(mv) = search_engine.search(depth, time_ms) {
+                    let mut mv_s = BC::encode_notation(mv.from);
+                    mv_s.extend(BC::encode_notation(mv.to).chars());
+                    let promo = if mv.flags.contains(MoveFlags::PROMOTE_Q) {
+                        "q"
+                    } else if mv.flags.contains(MoveFlags::PROMOTE_R) {
+                        "r"
+                    } else if mv.flags.contains(MoveFlags::PROMOTE_N) {
+                        "n"
+                    } else if mv.flags.contains(MoveFlags::PROMOTE_B) {
+                        "b"
+                    } else {
+                        ""
+                    };
+                    println!("bestmove {}{}", mv_s, promo);
+                }
+            }));
         }
 
         if input.starts_with("position") {

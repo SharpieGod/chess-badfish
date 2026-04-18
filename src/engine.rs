@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::movegen::*;
@@ -24,6 +26,7 @@ pub struct TTEntry {
     best_move: Option<Move>,
 }
 
+#[derive(Clone)]
 pub struct Engine {
     pub game: Game,
     pub history: HashMap<u64, u8>,
@@ -31,7 +34,7 @@ pub struct Engine {
     pub nodes: u64,
     pub game_history: HashMap<u64, u8>, // Order doesnt matter, can appear multiple times
     pub last_score: i32,
-    pub stop: bool,
+    pub stop: Arc<AtomicBool>,
     pub cached_attacks: [BitBoard; 2],
     pub cache_hash: u64,
     pub killers: [[Option<Move>; 2]; 64],
@@ -48,7 +51,7 @@ impl Engine {
             game_history: HashMap::new(),
             tt: vec![None; 1 << 22],
             last_score: 0,
-            stop: false,
+            stop: Arc::new(AtomicBool::new(false)),
             nodes: 0,
             cache_hash: 0,
             cached_attacks: [BitBoard(0); 2],
@@ -803,7 +806,7 @@ impl Engine {
         let start = Instant::now();
         let mut best_move = None;
         self.nodes = 0;
-        self.stop = false;
+        self.stop.store(false, Ordering::Relaxed);
         let deadline = time_ms;
         let mut score_history: Vec<i32> = Vec::new();
 
@@ -862,7 +865,7 @@ impl Engine {
                     }
                 }
 
-                if self.stop {
+                if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
             }
@@ -888,7 +891,7 @@ impl Engine {
                 break;
             }
 
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -944,7 +947,7 @@ impl Engine {
 
         for mv in moves.iter() {
             if start.elapsed().as_millis() as u64 >= deadline {
-                self.stop = true;
+                self.stop.store(true, Ordering::Relaxed);
                 return None; // genuine timeout
             }
 
@@ -952,7 +955,7 @@ impl Engine {
             let score = -self.negamax(depth - 1, -beta, -alpha, start, deadline, true, 0);
             self.game.undo_move(&undo);
 
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 return None;
             }
 
@@ -985,11 +988,11 @@ impl Engine {
     ) -> i32 {
         if self.nodes & 2047 == 0 {
             if start.elapsed().as_millis() as u64 >= deadline {
-                self.stop = true;
+                self.stop.store(true, Ordering::Relaxed);
             }
         }
 
-        if self.stop {
+        if self.stop.load(Ordering::Relaxed) {
             return 0;
         }
 
