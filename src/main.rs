@@ -50,7 +50,7 @@ fn main() {
         }
 
         if input == "uci" {
-            println!("id name BadFish");
+            println!("id name ViktorE");
             println!("id author DarkoS");
             println!("uciok");
         }
