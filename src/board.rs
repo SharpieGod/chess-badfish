@@ -800,6 +800,11 @@ pub struct Game {
 }
 
 impl Game {
+    pub fn encode_for_nn(&self) -> [f32; 782] {
+        let out = [0f32; 782];
+
+        out
+    }
     pub fn from_san(&mut self, san: &str) -> Option<Move> {
         let san = san.trim_end_matches(|c| c == '+' || c == '#' || c == '!' || c == '?');
         let color = if self.white_turn {

@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2.11.0"
+ndarray = "0.17.2"
+ort = "2.0.0-rc.12"
 rand = "0.10.1"
 rayon = "1.12.0"
 

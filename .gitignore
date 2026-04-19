@@ -16,3 +16,8 @@ lichess-bot/TEMP/*
 
 poistions.txt
 training-data.txt
+
+neural-network/venv
+neural-network/__pycache__
+neural-network/X.npy
+neural-network/y.npy
