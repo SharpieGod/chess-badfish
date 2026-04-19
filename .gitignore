@@ -1,2 +1,15 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
+
+/target
+lichess.pgn
+
+lichess-bot/*.yml
+lichess-bot/**/__pycache__
+lichess-bot//engines/*
+lichess-bot/!/engines/README.md
+lichess-bot/lichess_bot_auto_logs/*
+lichess-bot/.vscode/*
+lichess-bot/.vs/*
+lichess-bot/*.pgn
+lichess-bot/*.log
+lichess-bot/*.txt
+lichess-bot/TEMP/*
