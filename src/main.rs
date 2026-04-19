@@ -42,10 +42,6 @@ fn main() {
     let mut engine = Engine::new();
     let mut search_thread: Option<thread::JoinHandle<()>> = None;
 
-    let t = Instant::now();
-    let mut search_engine = engine.clone();
-    eprintln!("engine clone took {}ms", t.elapsed().as_millis());
-
     loop {
         let input = take_input();
 
