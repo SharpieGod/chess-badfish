@@ -98,10 +98,7 @@ impl Engine {
             cached_attacks: [BitBoard(0); 2],
             killers: [[None; 2]; 64],
             history_table: [[[0; 64]; 64]; 2],
-            nn: NeuralNet::new(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/neural-network/chess_net.onnx"
-            )),
+            nn: NeuralNet::new("/opt/chess/chess_net.onnx"),
         }
     }
 
