@@ -21,10 +21,11 @@ use crate::{
 };
 
 const TARGET: usize = 1_500_000;
-const MIN_ELO: u32 = 1900;
-const MIN_TC_SECONDS: i32 = 300;
+const MIN_ELO: u32 = 1500;
+const MIN_TC_SECONDS: i32 = 180;
 const SKIP_FIRST_N: usize = 10;
-const SAMPLE_EVERY: usize = 12;
+const SAMPLE_EVERY: usize = 6;
+const FILE: &str = "training-data.txt";
 
 fn strip_line_comments(line: &str, in_comment: &mut bool) -> String {
     let mut out = String::new();
@@ -236,8 +237,7 @@ pub fn parse_pgn() {
 
     // dedicated writer thread so SF threads never block on I/O
     let writer_thread = std::thread::spawn(move || {
-        let mut out =
-            BufWriter::new(File::create("positions.txt").expect("Cannot create positions.txt"));
+        let mut out = BufWriter::new(File::create(FILE).expect("Cannot create positions.txt"));
         for line in rx {
             writeln!(out, "{}", line).unwrap();
         }
@@ -254,7 +254,7 @@ pub fn parse_pgn() {
             SF.with(|sf| {
                 if let Some(cp) = sf.borrow_mut().eval(fen) {
                     let sf_sigmoid = 1.0 / (1.0 + (-cp as f32 / 400.0).exp());
-                    let blended = 0.5 * sf_sigmoid + 0.5 * outcome;
+                    let blended = 0.7 * sf_sigmoid + 0.3 * outcome;
                     tx.send(format!("{} | {:.4}", fen, blended)).unwrap();
                 }
 
@@ -272,5 +272,5 @@ pub fn parse_pgn() {
 
     writer_thread.join().unwrap();
 
-    eprintln!("Done! positions.txt written.");
+    eprintln!("Done! {} written.", FILE);
 }

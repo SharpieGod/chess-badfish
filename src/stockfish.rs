@@ -51,7 +51,7 @@ impl Stockfish {
     /// Returns centipawn score from white's perspective, capped at +/- 1000
     pub fn eval(&mut self, fen: &str) -> Option<i32> {
         self.send(&format!("position fen {}", fen));
-        self.send(&format!("go nodes 5000"));
+        self.send(&format!("go depth 5"));
 
         let mut score: Option<i32> = None;
         let mut line = String::new();

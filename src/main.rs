@@ -36,7 +36,7 @@ fn take_input() -> String {
 
 const START_POS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 fn main() {
-    // parse_pgn();
+    parse_pgn();
     // tune();
 
     let mut engine = Engine::new();
