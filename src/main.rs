@@ -41,6 +41,14 @@ fn main() {
 
     let mut engine = Engine::new();
     let mut search_thread: Option<thread::JoinHandle<()>> = None;
+    let start = std::time::Instant::now();
+    let input = engine.game.encode_for_nn();
+    let mut dummy = 0i32;
+    for _ in 0..100_000 {
+        dummy += engine.nn.eval(&input);
+    }
+    println!("dummy: {}", dummy); // prevent optimization
+    println!("100k evals: {}ms", start.elapsed().as_millis());
 
     loop {
         let input = take_input();
