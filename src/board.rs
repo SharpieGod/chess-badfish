@@ -801,10 +801,39 @@ pub struct Game {
 
 impl Game {
     pub fn encode_for_nn(&self) -> [f32; 782] {
-        let out = [0f32; 782];
+        let mut out = [0f32; 782];
+
+        for sq in 0..64usize {
+            if let Some(piece) = self.board_collection.mailbox[sq] {
+                let color = if piece.color == Color::White { 0 } else { 1 };
+                let kind = match piece.kind {
+                    PieceKind::Pawn => 0,
+                    PieceKind::Bishop => 1,
+                    PieceKind::Knight => 2,
+                    PieceKind::Rook => 3,
+                    PieceKind::Queen => 4,
+                    PieceKind::King => 5,
+                };
+                out[color * 384 + kind * 64 + sq] = 1.0;
+            }
+        }
+
+        out[768] = if self.white_turn { 1.0 } else { 0.0 };
+        out[769] = if self.k_white { 1.0 } else { 0.0 };
+        out[770] = if self.q_white { 1.0 } else { 0.0 };
+        out[771] = if self.k_black { 1.0 } else { 0.0 };
+        out[772] = if self.q_black { 1.0 } else { 0.0 };
+
+        if let Some(ep) = self.en_passant_square {
+            let (_, file) = BC::decode_tile(ep);
+            out[773 + file as usize] = 1.0;
+        }
+
+        out[781] = self.fifty_move_rule.min(100) as f32 / 100.0 as f32;
 
         out
     }
+
     pub fn from_san(&mut self, san: &str) -> Option<Move> {
         let san = san.trim_end_matches(|c| c == '+' || c == '#' || c == '!' || c == '?');
         let color = if self.white_turn {

@@ -47,6 +47,17 @@ def decode_fen(fen: str) -> torch.Tensor:
     return torch.tensor(inputs, dtype=torch.float32)
 
 
+tensor = decode_fen(
+    "r3k2r/1bq1bppp/pp1ppn2/2n5/2PNPP2/1PN1B3/P1Q1B1PP/R4RK1 w kq - 1 1"
+)
+
+for i, v in enumerate(tensor.tolist()):
+    if v != 0.0:
+        print(f"{i}: {v}")
+
+exit()
+
+
 class ChessNet(nn.Module):
     def __init__(self):
         super().__init__()

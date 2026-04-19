@@ -1,7 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use ndarray::{Array2, CowArray};
+use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 
 use crate::movegen::*;
 use crate::tuner::Trace;
@@ -26,6 +30,41 @@ pub struct TTEntry {
     best_move: Option<Move>,
 }
 
+pub struct NeuralNet {
+    session: Arc<Mutex<Session>>,
+}
+
+impl Clone for NeuralNet {
+    fn clone(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+        }
+    }
+}
+
+impl NeuralNet {
+    pub fn new(path: &str) -> Self {
+        let session = Arc::new(Mutex::new(
+            Session::builder()
+                .unwrap()
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .unwrap()
+                .commit_from_file(path)
+                .unwrap(),
+        ));
+        Self { session }
+    }
+    pub fn eval(&self, input: &[f32]) -> i32 {
+        let value = ort::value::Value::from_array(([1usize, 782usize], input.to_vec())).unwrap();
+        let mut session = self.session.lock().unwrap();
+        let outputs = session.run(ort::inputs!["input" => value]).unwrap();
+        let tensor = outputs["output"].try_extract_tensor::<f32>().unwrap();
+        let sigmoid = tensor.1[0].clamp(0.001, 0.999);
+        let cp = -400.0 * (1.0 / sigmoid - 1.0).ln();
+        cp as i32
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub game: Game,
@@ -39,6 +78,7 @@ pub struct Engine {
     pub cache_hash: u64,
     pub killers: [[Option<Move>; 2]; 64],
     pub history_table: [[[i32; 64]; 64]; 2],
+    pub nn: NeuralNet,
 }
 
 // Values from PeSTO
@@ -57,6 +97,7 @@ impl Engine {
             cached_attacks: [BitBoard(0); 2],
             killers: [[None; 2]; 64],
             history_table: [[[0; 64]; 64]; 2],
+            nn: NeuralNet::new("./neural-net/chess_net.onnx"),
         }
     }
 
@@ -1007,7 +1048,7 @@ impl Engine {
 
         if search_count >= 2 || game_count >= 2 {
             self.refresh_cache();
-            let eval = self.static_eval();
+            let eval = self.nn.eval(&self.game.encode_for_nn());
             return if eval > 0 { -50 } else { 50 };
         }
 
@@ -1053,7 +1094,7 @@ impl Engine {
 
             if has_non_pawns {
                 self.refresh_cache();
-                let static_eval = self.static_eval();
+                let static_eval = self.nn.eval(&self.game.encode_for_nn());
 
                 if static_eval >= beta {
                     let r = 3 + (depth / 6) as u8 + if static_eval - beta > 200 { 1 } else { 0 };
@@ -1343,7 +1384,7 @@ impl Engine {
         };
 
         self.refresh_cache();
-        let stand_pat = self.static_eval();
+        let stand_pat = self.nn.eval(&self.game.encode_for_nn());
 
         if stand_pat >= beta {
             return stand_pat;
