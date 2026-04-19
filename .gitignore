@@ -13,3 +13,6 @@ lichess-bot/*.pgn
 lichess-bot/*.log
 lichess-bot/*.txt
 lichess-bot/TEMP/*
+
+poistions.txt
+training-data.txt

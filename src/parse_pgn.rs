@@ -20,11 +20,11 @@ use crate::{
     stockfish::Stockfish,
 };
 
-const TARGET: usize = 1_500_000;
+const TARGET: usize = 10_000_000;
 const MIN_ELO: u32 = 1500;
 const MIN_TC_SECONDS: i32 = 180;
 const SKIP_FIRST_N: usize = 10;
-const SAMPLE_EVERY: usize = 6;
+const SAMPLE_EVERY: usize = 8;
 const FILE: &str = "training-data.txt";
 
 fn strip_line_comments(line: &str, in_comment: &mut bool) -> String {
