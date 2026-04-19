@@ -28,6 +28,7 @@ pub struct TTEntry {
     score: i32,
     flag: TTFlag,
     best_move: Option<Move>,
+    static_eval: Option<i32>,
 }
 
 pub struct NeuralNet {
@@ -44,17 +45,18 @@ impl Clone for NeuralNet {
 
 impl NeuralNet {
     pub fn new(path: &str) -> Self {
-        let session = Arc::new(Mutex::new(
-            Session::builder()
-                .unwrap()
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .unwrap()
-                .commit_from_file(path)
-                .unwrap(),
-        ));
-        Self { session }
+        let session = Session::builder()
+            .unwrap()
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .unwrap()
+            .commit_from_file(path)
+            .unwrap();
+        Self {
+            session: Arc::new(Mutex::new(session)),
+        }
     }
-    pub fn eval(&self, input: &[f32]) -> i32 {
+
+    pub fn eval(&mut self, input: &[f32]) -> i32 {
         let value = ort::value::Value::from_array(([1usize, 782usize], input.to_vec())).unwrap();
         let mut session = self.session.lock().unwrap();
         let outputs = session.run(ort::inputs!["input" => value]).unwrap();
@@ -64,7 +66,6 @@ impl NeuralNet {
         cp as i32
     }
 }
-
 #[derive(Clone)]
 pub struct Engine {
     pub game: Game,
@@ -846,7 +847,6 @@ impl Engine {
         self.killers = [[None; 2]; 64];
         self.history_table = [[[0; 64]; 64]; 2];
 
-        self.tt.iter_mut().for_each(|e| *e = None);
         let start = Instant::now();
         let mut best_move = None;
         self.nodes = 0;
@@ -855,7 +855,12 @@ impl Engine {
         let mut score_history: Vec<i32> = Vec::new();
 
         for depth in 1..=max_depth {
+            if start.elapsed().as_millis() as u64 >= deadline / 2 {
+                break;
+            }
+
             self.history.clear();
+
             let mut delta = if score_history.len() >= 4 {
                 let recent_swing = (score_history[score_history.len() - 1]
                     - score_history[score_history.len() - 3])
@@ -940,6 +945,10 @@ impl Engine {
             }
 
             score_history.push(self.last_score);
+
+            if start.elapsed().as_millis() as u64 >= deadline / 2 {
+                break;
+            }
         }
 
         best_move
@@ -1030,7 +1039,7 @@ impl Engine {
         can_null: bool,
         ply: u8,
     ) -> i32 {
-        if self.nodes & 2047 == 0 {
+        if self.nodes & 1023 == 0 {
             if start.elapsed().as_millis() as u64 >= deadline {
                 self.stop.store(true, Ordering::Relaxed);
             }
@@ -1050,9 +1059,7 @@ impl Engine {
         let game_count = self.game_history.get(&hash).copied().unwrap_or(0);
 
         if search_count >= 2 || game_count >= 2 {
-            self.refresh_cache();
-            let eval = self.nn.eval(&self.game.encode_for_nn());
-            return if eval > 0 { -50 } else { 50 };
+            return 0;
         }
 
         let original_alpha = alpha;
@@ -1088,6 +1095,24 @@ impl Engine {
 
         // Null move pruning
 
+        let static_eval = if in_check {
+            None
+        } else {
+            let cached = self.tt[tt_idx]
+                .filter(|e| e.hash == hash)
+                .and_then(|e| e.static_eval);
+            Some(cached.unwrap_or_else(|| self.nn.eval(&self.game.encode_for_nn())))
+        };
+
+        if !in_check && depth <= 6 && beta < 900_000 && beta > -900_000 {
+            let margin = 80 * depth as i32;
+            if let Some(eval) = static_eval {
+                if eval - margin >= beta {
+                    return eval - margin; // fail-soft
+                }
+            }
+        }
+
         if can_null && !in_check && depth >= 3 && beta < 900_000 {
             let bc = self.game.board_collection;
             let has_non_pawns = (bc.occupied_color(color).0
@@ -1096,8 +1121,7 @@ impl Engine {
                 != 0;
 
             if has_non_pawns {
-                self.refresh_cache();
-                let static_eval = self.nn.eval(&self.game.encode_for_nn());
+                let static_eval = static_eval.unwrap();
 
                 if static_eval >= beta {
                     let r = 3 + (depth / 6) as u8 + if static_eval - beta > 200 { 1 } else { 0 };
@@ -1127,7 +1151,6 @@ impl Engine {
                     self.game.white_turn = !self.game.white_turn;
                     self.game.en_passant_square = prev_ep;
                     self.game.hash = prev_hash;
-                    self.cache_hash = 0; // force cache refresh
 
                     // Position so good, that oponent wouldnt let us reach it
                     if score >= beta {
@@ -1195,6 +1218,35 @@ impl Engine {
         let mut best_move = None;
 
         for (i, m) in moves.iter().enumerate() {
+            if depth == 1
+                && !in_check
+                && !m.flags.contains(MoveFlags::CAPTURE)
+                && !m.flags.intersects(
+                    MoveFlags::PROMOTE_Q
+                        | MoveFlags::PROMOTE_R
+                        | MoveFlags::PROMOTE_N
+                        | MoveFlags::PROMOTE_B,
+                )
+                && best_move.is_some()
+            {
+                if let Some(eval) = static_eval {
+                    if eval + 150 <= alpha {
+                        continue;
+                    }
+                }
+            }
+
+            if !in_check
+                && depth <= 3
+                && best_move.is_some()  // already have a move that raised alpha
+                && !m.flags.contains(MoveFlags::CAPTURE)
+                && !m.flags.intersects(MoveFlags::PROMOTE_Q | MoveFlags::PROMOTE_R
+                                    | MoveFlags::PROMOTE_N | MoveFlags::PROMOTE_B)
+                && i >= 3 + (depth as usize) * (depth as usize)
+            {
+                continue;
+            }
+
             let u = self.game.make_move(m);
 
             let score = if i == 0 {
@@ -1248,7 +1300,7 @@ impl Engine {
             self.game.undo_move(&u);
 
             if score >= beta {
-                // Move too good
+                // Move too good, but useful to keep
                 if !m.flags.contains(MoveFlags::CAPTURE)
                     && !m.flags.intersects(
                         MoveFlags::PROMOTE_Q
@@ -1259,8 +1311,13 @@ impl Engine {
                 {
                     let bonus = (depth as i32) * (depth as i32);
                     let color_idx = color as usize;
-                    self.history_table[color_idx][m.from as usize][m.to as usize] += bonus;
 
+                    // Reward the move that caused the cutoff (with gravity)
+                    let current = self.history_table[color_idx][m.from as usize][m.to as usize];
+                    let clamped_bonus = bonus - current * bonus.abs() / 16384;
+                    self.history_table[color_idx][m.from as usize][m.to as usize] += clamped_bonus;
+
+                    // Penalize the earlier quiet moves that didn't cause a cutoff (with gravity)
                     for prev in moves[..i].iter() {
                         if !prev.flags.contains(MoveFlags::CAPTURE)
                             && !prev.flags.intersects(
@@ -1270,8 +1327,11 @@ impl Engine {
                                     | MoveFlags::PROMOTE_B,
                             )
                         {
-                            self.history_table[color_idx][prev.from as usize][prev.to as usize] -=
-                                bonus;
+                            let prev_current =
+                                self.history_table[color_idx][prev.from as usize][prev.to as usize];
+                            let prev_clamped = -bonus - prev_current * bonus.abs() / 16384;
+                            self.history_table[color_idx][prev.from as usize][prev.to as usize] +=
+                                prev_clamped;
                         }
                     }
 
@@ -1292,6 +1352,7 @@ impl Engine {
                     score: score_to_tt(score, ply),
                     flag: TTFlag::LowerBound,
                     best_move: Some(*m),
+                    static_eval,
                 });
                 if let Some(count) = self.history.get_mut(&hash) {
                     *count -= 1;
@@ -1322,6 +1383,7 @@ impl Engine {
             score: score_to_tt(alpha, ply),
             flag,
             best_move,
+            static_eval,
         });
 
         if let Some(count) = self.history.get_mut(&hash) {
@@ -1386,8 +1448,10 @@ impl Engine {
             Color::Black
         };
 
-        self.refresh_cache();
-        let stand_pat = self.nn.eval(&self.game.encode_for_nn());
+        let stand_pat = self.tt[(hash as usize) & (self.tt.len() - 1)]
+            .filter(|e| e.hash == hash)
+            .and_then(|e| e.static_eval)
+            .unwrap_or_else(|| self.nn.eval(&self.game.encode_for_nn()));
 
         if stand_pat >= beta {
             return stand_pat;

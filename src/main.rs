@@ -41,14 +41,10 @@ fn main() {
 
     let mut engine = Engine::new();
     let mut search_thread: Option<thread::JoinHandle<()>> = None;
-    let start = std::time::Instant::now();
-    let input = engine.game.encode_for_nn();
-    let mut dummy = 0i32;
-    for _ in 0..100_000 {
-        dummy += engine.nn.eval(&input);
-    }
-    println!("dummy: {}", dummy); // prevent optimization
-    println!("100k evals: {}ms", start.elapsed().as_millis());
+
+    let t = Instant::now();
+    let mut search_engine = engine.clone();
+    eprintln!("engine clone took {}ms", t.elapsed().as_millis());
 
     loop {
         let input = take_input();
@@ -127,9 +123,24 @@ fn main() {
                     .windows(2)
                     .find(|w| w[0] == "btime")
                     .and_then(|w| w[1].parse::<u64>().ok())
+            };
+
+            let increment = if engine.game.white_turn {
+                parts
+                    .windows(2)
+                    .find(|w| w[0] == "winc")
+                    .and_then(|w| w[1].parse::<u64>().ok())
+            } else {
+                parts
+                    .windows(2)
+                    .find(|w| w[0] == "binc")
+                    .and_then(|w| w[1].parse::<u64>().ok())
             }
-            .map(|t| t / 20) // use 1/20th of remaining time per move
-            .unwrap_or(5000);
+            .unwrap_or(0);
+
+            let time_ms = time_ms
+                .map(|t| (t / 30) + (increment * 3 / 4))
+                .unwrap_or(5000);
 
             let mut search_engine = engine.clone();
 

@@ -3,7 +3,7 @@ cargo build --release
 
 cutechess-cli \
   -engine cmd=./target/release/chess-badfish name=New proto=uci \
-  -engine cmd=./saved-brains/v10 name=Old proto=uci \
+  -engine cmd=./saved-brains/v12 name=Old proto=uci \
   -each tc=10+0.1 \
   -games 2 \
   -rounds 2500 \
