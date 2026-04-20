@@ -40,6 +40,8 @@ lichess-bot/              lichess-bot integration for online play
 
 ## Building
 
+After cloning the repo, create a symbolic link at /opt/chess to /path/to/repo/neural-network.
+So that the binary can find the neural network weights.
 Requires Rust (edition 2024, so 1.85+) and ONNX Runtime.
 
 ```
