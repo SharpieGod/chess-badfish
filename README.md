@@ -5,9 +5,13 @@ A UCI chess engine written in Rust, with a small neural network evaluation expor
 Strength is around 1650 Elo based on self-play and lichess games.
 
 ## How To Use
-[Hosted on lichess](https://lichess.org/@/ViktorEChessBot)
+[Playable on lichess](https://lichess.org/@/ViktorEChessBot)
 
-You have to create an account to play, then press `challenge` on my bot's profile, and select a `time control` (you need to specify a time control, it **cant handle infinite time**).
+1. Create a lichess account
+2. Press `challenge` on my bot's profile
+3. Select `Real Time`
+4. Select any time control
+5. Press `Challenge ViktorEChessBot`
 
 ## Features
 
