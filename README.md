@@ -4,6 +4,9 @@ A UCI chess engine written in Rust, with a small neural network evaluation expor
 
 Strength is around 1650 Elo based on self-play and lichess games.
 
+[Hosted on lichess](https://lichess.org/@/ViktorEChessBot)
+You have to create an account to play, then press `challenge` on my bot's profile, and select a `time control` (you need to specify a time control, it **cant handle infinite time**).
+
 ## Features
 
 ### Search
@@ -38,11 +41,15 @@ training-data.txt         labeled positions for NN training
 lichess-bot/              lichess-bot integration for online play
 ```
 
-## Building
+## Running Locally
 
-After cloning the repo, create a symbolic link at /opt/chess to /path/to/repo/neural-network.
+After cloning the repo, create a symbolic link at `/opt/chess` to `/path/to/repo/neural-network`.
 So that the binary can find the neural network weights.
 Requires Rust (edition 2024, so 1.85+) and ONNX Runtime.
+
+You will have to get your own dataset and weights, becasue theyre too large to host anywhere (12 GB),
+but the script to generate datasets is in the `/src` directory.
+And the script to train the network is in the `/neural-network` directory.
 
 ```
 cargo build --release
