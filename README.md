@@ -48,9 +48,10 @@ After cloning the repo, create a symbolic link at `/opt/chess` to `/path/to/repo
 So that the binary can find the neural network weights.
 Requires Rust (edition 2024, so 1.85+) and ONNX Runtime.
 
-You will have to get your own dataset and weights, becasue theyre too large to host anywhere (12 GB),
-but the script to generate datasets is in the `/src` directory.
-And the script to train the network is in the `/neural-network` directory.
+You will have to generate your own dataset and weights, becasue theyre too large to host anywhere (12 GB),
+the script to generate datasets is in the `/src` directory (download a large game dataset from lichess and name it `lichess.pgn`),
+make sure the generate positions are in `/training_data.txt`
+the script to train the network is in the `/neural-network` directory.
 
 ```
 cargo build --release
